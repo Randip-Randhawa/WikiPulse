@@ -1,0 +1,28 @@
+# --- Ingestion ---
+sseclient-py==1.8.0
+requests==2.32.3
+confluent-kafka==2.5.3
+
+# --- Processing (Spark) ---
+pyspark==3.5.1
+
+# --- Enrichment ---
+httpx==0.27.2
+
+# --- Storage ---
+psycopg2-binary==2.9.9
+pyarrow==17.0.0
+pandas==2.2.2
+
+# --- Dashboard ---
+streamlit==1.38.0
+plotly==5.24.0
+SQLAlchemy==2.0.35
+
+# --- Shared / config ---
+python-dotenv==1.0.1
+
+# --- Testing ---
+pytest==8.3.3
+pytest-mock==3.14.0
+freezegun==1.5.1

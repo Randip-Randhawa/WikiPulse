@@ -1,0 +1,15 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir \
+    sseclient-py==1.8.0 \
+    requests==2.32.3 \
+    confluent-kafka==2.5.3 \
+    python-dotenv==1.0.1
+
+COPY common/ ./common/
+COPY ingestion/ ./ingestion/
+
+CMD ["python", "-m", "ingestion.sse_consumer"]

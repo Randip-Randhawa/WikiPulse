@@ -1,0 +1,25 @@
+FROM python:3.11-slim
+
+# Spark needs a JDK to run.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openjdk-17-jre-headless \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir \
+    pyspark==3.5.1 \
+    psycopg2-binary==2.9.9 \
+    pyarrow==17.0.0 \
+    pandas==2.2.2 \
+    httpx==0.27.2 \
+    python-dotenv==1.0.1
+
+COPY common/ ./common/
+COPY processing/ ./processing/
+COPY enrichment/ ./enrichment/
+COPY storage/ ./storage/
+
+CMD ["python", "-m", "processing.streaming_job"]
