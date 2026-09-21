@@ -81,7 +81,12 @@ class WikimediaSSEConsumer:
         """Yield decoded JSON payloads from the live SSE stream. Raises on
         connection-level failures so the caller can apply backoff."""
         wm_config = self._settings.wikimedia
-        response = requests.get(wm_config.stream_url, stream=True, timeout=(10, 90))
+        response = requests.get(
+            wm_config.stream_url,
+            stream=True,
+            timeout=(10, 90),
+            headers={"User-Agent": wm_config.user_agent},
+        )
         response.raise_for_status()
         client = SSEClient(response)
         for sse_event in client.events():

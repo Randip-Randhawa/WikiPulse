@@ -55,6 +55,8 @@ def _get_list(name: str, default: List[str]) -> List[str]:
 class WikimediaConfig:
     stream_url: str = field(default_factory=lambda: _get_str(
         "WIKIMEDIA_STREAM_URL", "https://stream.wikimedia.org/v2/stream/recentchange"))
+    user_agent: str = field(default_factory=lambda: _get_str(
+        "WIKIMEDIA_USER_AGENT", "WikiPulse/1.0 (b24cm1051@gmail.com) requests/2.32.3"))
     wiki_filter: List[str] = field(default_factory=lambda: _get_list("WIKIMEDIA_WIKI_FILTER", []))
     reconnect_min_delay: float = field(default_factory=lambda: _get_float("SSE_RECONNECT_MIN_DELAY", 1.0))
     reconnect_max_delay: float = field(default_factory=lambda: _get_float("SSE_RECONNECT_MAX_DELAY", 60.0))
