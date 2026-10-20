@@ -28,6 +28,11 @@ def _sample_event(**overrides) -> WikipediaEvent:
         is_revert=False,
         revert_target_revision_id=None,
         ingestion_timestamp=1_700_000_001.0,
+        provenance_id="ingest-node-01:2026-10-04T12:00:01.104Z:part-1:off-49120",
+        user_type="REGISTERED",
+        is_minor=False,
+        comment_length=9,
+        is_large_jump=False,
     )
     defaults.update(overrides)
     return WikipediaEvent(**defaults)

@@ -11,14 +11,70 @@ type, so the caller can safely skip/log the event without crashing.
 
 from __future__ import annotations
 
+import ipaddress
+import os
 import re
 import time
+from datetime import datetime, timezone
+from enum import Enum
 from typing import Any, Optional
 
 from common.models import WikipediaEvent
 
+# User classification enum matching Lab 6-8 canonical data schema.
+class UserType(str, Enum):
+    BOT = "BOT"
+    ANONYMOUS = "ANONYMOUS"
+    REGISTERED = "REGISTERED"
+
+
+# Regex to isolate anonymous editors based on IPv4 or IPv6 address.
+_IPV4_RE = re.compile(
+    r"^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$"
+)
+_IPV6_RE = re.compile(
+    r"^(?:[A-F0-9]{1,4}:){7}[A-F0-9]{1,4}$|^(?:[0-9a-fA-F]{1,4}:)*::(?:[0-9a-fA-F]{1,4}:)*[0-9a-fA-F]{1,4}$",
+    re.IGNORECASE,
+)
+
+
+def classify_user_type(user: Optional[str], is_bot: bool) -> str:
+    """Classify user into categorical enum (BOT, ANONYMOUS, REGISTERED)."""
+    if is_bot:
+        return UserType.BOT.value
+    if not user or not user.strip():
+        return UserType.ANONYMOUS.value
+    user_clean = user.strip()
+    if _IPV4_RE.match(user_clean) or _IPV6_RE.match(user_clean):
+        return UserType.ANONYMOUS.value
+    try:
+        ipaddress.ip_address(user_clean)
+        return UserType.ANONYMOUS.value
+    except ValueError:
+        pass
+    return UserType.REGISTERED.value
+
+
+def make_provenance_id(
+    host_node: Optional[str] = None,
+    ingest_epoch: Optional[str] = None,
+    partition: int = 0,
+    offset: int = 0,
+) -> str:
+    """Generate deterministic composite provenance identifier:
+    (HostNode) : (IngestEpoch) : (Partition) : (Offset)
+    e.g. ingest-node-01:2026-10-04T12:00:01.104Z:part-1:off-49120
+    """
+    host = host_node or os.environ.get("INGEST_NODE_ID", "ingest-node-01")
+    epoch = (
+        ingest_epoch
+        or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    )
+    return f"{host}:{epoch}:part-{partition}:off-{offset}"
+
+
 # Tags Wikimedia attaches to revert-like actions (rollback/undo tools).
-_REVERT_TAGS = {"mw-rollback", "mw-undo", "mw-manual-revert"}
+_REVERT_TAGS = {"mw-revert", "mw-rollback", "mw-undo", "mw-manual-revert"}
 
 # Fallback heuristic: edit summaries that clearly indicate a revert/undo when
 # tags are unavailable (e.g. "Undid revision 123456789 by [[Special:...]]").
@@ -104,6 +160,19 @@ def normalize_event(raw: dict[str, Any]) -> WikipediaEvent:
     comment = raw.get("comment")
     is_revert, revert_target = _detect_revert(raw, comment)
 
+    now = time.time()
+    ingest_epoch_iso = datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    provenance_id = raw.get("provenance_id") or make_provenance_id(
+        ingest_epoch=ingest_epoch_iso,
+        partition=raw.get("kafka_partition", 0),
+        offset=raw.get("kafka_offset", 0),
+    )
+    is_bot = bool(raw.get("bot", False))
+    user_type = classify_user_type(raw.get("user"), is_bot)
+    is_minor = bool(raw.get("minor", False) or raw.get("is_minor", False))
+    comment_len = len(comment) if comment is not None else None
+    is_large_jump = abs(byte_delta) > 100_000 if byte_delta is not None else False
+
     return WikipediaEvent(
         event_id=event_id,
         timestamp=timestamp,
@@ -116,25 +185,36 @@ def normalize_event(raw: dict[str, Any]) -> WikipediaEvent:
         previous_revision_id=previous_revision_id,
         user=raw.get("user"),
         user_id=raw.get("userid") or raw.get("user_id"),
-        is_bot=bool(raw.get("bot", False)),
+        is_bot=is_bot,
         comment=comment,
         byte_length_new=int(byte_new) if isinstance(byte_new, (int, float)) else None,
         byte_length_old=int(byte_old) if isinstance(byte_old, (int, float)) else None,
         byte_length_delta=byte_delta,
         is_revert=is_revert,
         revert_target_revision_id=revert_target,
-        ingestion_timestamp=time.time(),
+        ingestion_timestamp=now,
+        provenance_id=provenance_id,
+        user_type=user_type,
+        is_minor=is_minor,
+        comment_length=comment_len,
+        is_large_jump=is_large_jump,
     )
 
 
 def should_ignore(raw: dict[str, Any], wiki_filter: list[str]) -> bool:
     """Return True if this raw event should be dropped before normalization
-    (e.g. not one of the wikis we care about, or a non-content event type
-    that carries no useful editing signal)."""
+    (e.g. not one of the wikis we care about, non-mainspace content, or a
+    non-content event type that carries no useful editing signal)."""
     if wiki_filter:
         wiki = raw.get("wiki") or raw.get("server_name")
         if wiki not in wiki_filter:
             return True
+
+    # Namespace Isolation (Stage 2): Retain strictly Main/Article space (namespace == 0).
+    # User talk pages (ns: 3), categories (ns: 14), and file maintenance namespaces are dropped.
+    namespace = raw.get("namespace")
+    if namespace is not None and namespace != 0:
+        return True
 
     # "log" events (user rights changes, deletions, etc.) and
     # "categorize" events don't represent page-content edits and are not

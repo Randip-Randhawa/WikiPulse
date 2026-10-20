@@ -43,6 +43,10 @@ CREATE TABLE IF NOT EXISTS edit_events (
     kafka_partition         INTEGER,      -- with kafka_offset, where the event was read from
     kafka_offset            BIGINT,
     ingested_at             TIMESTAMPTZ NOT NULL DEFAULT now(),  -- when this row was written to PostgreSQL
+    provenance_id           VARCHAR(128),
+    user_type               VARCHAR(16) NOT NULL DEFAULT 'REGISTERED',
+    is_minor                BOOLEAN NOT NULL DEFAULT FALSE,
+    comment_length          SMALLINT NOT NULL DEFAULT 0,
     PRIMARY KEY (id, event_time),
     UNIQUE (event_id, event_time)
 ) PARTITION BY RANGE (event_time);
@@ -56,6 +60,12 @@ CREATE INDEX IF NOT EXISTS idx_edit_events_user ON edit_events ("user");
 -- view reads only them, per page and newest first.
 CREATE INDEX IF NOT EXISTS idx_edit_events_reverts ON edit_events (wiki, page_title, event_time DESC)
     WHERE is_revert;
+
+-- Composite temporal B-Tree and partial indexes as specified in Lab 6-8 report
+CREATE INDEX IF NOT EXISTS idx_edits_page_time ON edit_events (page_title, event_time DESC);
+CREATE INDEX IF NOT EXISTS idx_edits_filtered_reverts ON edit_events (page_title, event_time DESC)
+    WHERE is_revert;
+CREATE INDEX IF NOT EXISTS idx_edits_audit ON edit_events (event_time DESC);
 
 CREATE TABLE IF NOT EXISTS page_activity_windows (
     id                  BIGSERIAL,
@@ -71,6 +81,7 @@ CREATE TABLE IF NOT EXISTS page_activity_windows (
     revert_count        INTEGER NOT NULL DEFAULT 0,
     net_byte_delta      BIGINT NOT NULL DEFAULT 0,
     edit_velocity       DOUBLE PRECISION NOT NULL DEFAULT 0,  -- edits per minute
+    provenance_id       VARCHAR(128),
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (id, window_start),
     UNIQUE (wiki, page_title, window_start, window_end)
@@ -98,6 +109,7 @@ CREATE TABLE IF NOT EXISTS anomaly_events (
     anomaly_score       DOUBLE PRECISION,
     anomaly_type        TEXT NOT NULL,  -- 'median_mad' | 'count_fallback'
     threshold_used      DOUBLE PRECISION,
+    provenance_id       VARCHAR(128),
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -137,6 +149,7 @@ CREATE TABLE IF NOT EXISTS edit_war_signals (
     edit_burst_count    INTEGER NOT NULL DEFAULT 0,
     conflict_score      DOUBLE PRECISION NOT NULL DEFAULT 0,
     flag                BOOLEAN NOT NULL DEFAULT FALSE,
+    provenance_id       VARCHAR(128),
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -212,3 +225,37 @@ ALTER TABLE pipeline_metrics ADD COLUMN IF NOT EXISTS details JSONB;
 
 CREATE INDEX IF NOT EXISTS idx_pipeline_metrics_time ON pipeline_metrics (recorded_at DESC);
 CREATE INDEX IF NOT EXISTS idx_pipeline_metrics_component ON pipeline_metrics (component, recorded_at DESC);
+
+-- Ensure newly added columns exist on existing tables
+ALTER TABLE edit_events ADD COLUMN IF NOT EXISTS provenance_id VARCHAR(128);
+ALTER TABLE edit_events ADD COLUMN IF NOT EXISTS user_type VARCHAR(16) NOT NULL DEFAULT 'REGISTERED';
+ALTER TABLE edit_events ADD COLUMN IF NOT EXISTS is_minor BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE edit_events ADD COLUMN IF NOT EXISTS comment_length SMALLINT NOT NULL DEFAULT 0;
+
+ALTER TABLE page_activity_windows ADD COLUMN IF NOT EXISTS provenance_id VARCHAR(128);
+ALTER TABLE anomaly_events ADD COLUMN IF NOT EXISTS provenance_id VARCHAR(128);
+ALTER TABLE edit_war_signals ADD COLUMN IF NOT EXISTS provenance_id VARCHAR(128);
+
+-- Analytical views aligning with Lab 6-8 report nomenclature
+CREATE OR REPLACE VIEW fact_edit_events AS
+SELECT
+    event_id,
+    provenance_id,
+    revision_id,
+    previous_revision_id AS parent_revision_id,
+    page_title,
+    "user" AS user_name,
+    user_type,
+    event_time AS event_timestamp,
+    COALESCE(ingestion_time, event_time) AS ingest_timestamp,
+    COALESCE(byte_length_delta, 0) AS byte_delta,
+    is_minor,
+    is_revert,
+    comment_length,
+    wiki,
+    namespace,
+    revert_target_revision_id AS revert_target_id
+FROM edit_events;
+
+CREATE OR REPLACE VIEW fact_anomalies AS
+SELECT * FROM anomaly_events;

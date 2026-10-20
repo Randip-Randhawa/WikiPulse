@@ -117,7 +117,55 @@ class TestNormalizeEvent:
         assert event.revert_target_revision_id is None
 
 
+    def test_revert_tag_mw_revert_marks_is_revert(self):
+        raw = _base_raw_event(tags=["mw-revert"])
+        event = normalize_event(raw)
+        assert event.is_revert is True
+
+    def test_user_type_classification(self):
+        bot_event = normalize_event(_base_raw_event(bot=True, user="HelperBot"))
+        assert bot_event.user_type == "BOT"
+
+        ipv4_event = normalize_event(_base_raw_event(bot=False, user="192.168.1.100"))
+        assert ipv4_event.user_type == "ANONYMOUS"
+
+        ipv6_event = normalize_event(_base_raw_event(bot=False, user="2001:0db8:85a3:0000:0000:8a2e:0370:7334"))
+        assert ipv6_event.user_type == "ANONYMOUS"
+
+        reg_event = normalize_event(_base_raw_event(bot=False, user="RegisteredUser"))
+        assert reg_event.user_type == "REGISTERED"
+
+    def test_provenance_id_generation(self):
+        event = normalize_event(_base_raw_event())
+        assert event.provenance_id is not None
+        assert "part-0:off-0" in event.provenance_id
+        assert "ingest-node-" in event.provenance_id
+
+    def test_large_jump_flagging(self):
+        normal_event = normalize_event(_base_raw_event(length={"old": 5000, "new": 5050}))
+        assert normal_event.is_large_jump is False
+
+        large_jump_event = normalize_event(_base_raw_event(length={"old": 5000, "new": 110_000}))
+        assert large_jump_event.is_large_jump is True
+
+    def test_minor_and_comment_length(self):
+        event = normalize_event(_base_raw_event(minor=True, comment="Short comment"))
+        assert event.is_minor is True
+        assert event.comment_length == 13
+
+
 class TestShouldIgnore:
+    def test_non_mainspace_events_are_ignored(self):
+        talk_event = _base_raw_event(type="edit", namespace=3)
+        assert should_ignore(talk_event, wiki_filter=[]) is True
+
+        cat_event = _base_raw_event(type="edit", namespace=14)
+        assert should_ignore(cat_event, wiki_filter=[]) is True
+
+    def test_mainspace_events_are_not_ignored(self):
+        main_event = _base_raw_event(type="edit", namespace=0)
+        assert should_ignore(main_event, wiki_filter=[]) is False
+
     def test_log_events_are_ignored(self):
         raw = _base_raw_event(type="log")
         assert should_ignore(raw, wiki_filter=[]) is True

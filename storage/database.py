@@ -237,7 +237,19 @@ class Database:
     # ------------------------------------------------------------------
     # Batch writes (used by the Spark foreachBatch sink)
     # ------------------------------------------------------------------
-    def upsert_edit_events(self, rows: Sequence[dict[str, Any]]) -> None:
+    def _execute_values(
+        self,
+        query: str,
+        argslist: Sequence[tuple | list],
+        template: Optional[str] = None,
+        page_size: int = 50,
+    ) -> None:
+        """Execute micro-batch insert using psycopg2.extras.execute_values with 50-row micro-batching."""
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                psycopg2.extras.execute_values(cur, query, argslist, template=template, page_size=page_size)
+
+    def upsert_edit_events(self, rows: Sequence[dict[str, Any]], page_size: int = 50) -> None:
         if not rows:
             return
         query = """
@@ -246,32 +258,52 @@ class Database:
                 namespace, revision_id, previous_revision_id, "user", user_id,
                 is_bot, comment, byte_length_new, byte_length_old,
                 byte_length_delta, is_revert, revert_target_revision_id,
-                ingestion_time, kafka_partition, kafka_offset
-            ) VALUES (
-                %(event_id)s, %(event_time)s, %(wiki)s, %(event_type)s, %(page_title)s,
-                %(page_id)s, %(namespace)s, %(revision_id)s, %(previous_revision_id)s,
-                %(user)s, %(user_id)s, %(is_bot)s, %(comment)s, %(byte_length_new)s,
-                %(byte_length_old)s, %(byte_length_delta)s, %(is_revert)s,
-                %(revert_target_revision_id)s, %(ingestion_time)s, %(kafka_partition)s,
-                %(kafka_offset)s
-            )
+                ingestion_time, kafka_partition, kafka_offset,
+                provenance_id, user_type, is_minor, comment_length
+            ) VALUES %s
             ON CONFLICT (event_id, event_time) DO NOTHING
         """
-        self._executemany(query, rows)
+        tuples = [
+            (
+                r["event_id"],
+                r["event_time"],
+                r["wiki"],
+                r["event_type"],
+                r["page_title"],
+                r.get("page_id"),
+                r.get("namespace"),
+                r.get("revision_id"),
+                r.get("previous_revision_id"),
+                r.get("user"),
+                r.get("user_id"),
+                bool(r.get("is_bot") or False),
+                r.get("comment"),
+                r.get("byte_length_new"),
+                r.get("byte_length_old"),
+                r.get("byte_length_delta"),
+                bool(r.get("is_revert") or False),
+                r.get("revert_target_revision_id"),
+                r.get("ingestion_time"),
+                r.get("kafka_partition"),
+                r.get("kafka_offset"),
+                r.get("provenance_id"),
+                r.get("user_type") or "REGISTERED",
+                bool(r.get("is_minor") or False),
+                r.get("comment_length") or (len(r["comment"]) if r.get("comment") else 0),
+            )
+            for r in rows
+        ]
+        self._execute_values(query, tuples, page_size=page_size)
 
-    def upsert_activity_windows(self, rows: Sequence[dict[str, Any]]) -> None:
+    def upsert_activity_windows(self, rows: Sequence[dict[str, Any]], page_size: int = 50) -> None:
         if not rows:
             return
         query = """
             INSERT INTO page_activity_windows (
                 wiki, page_id, page_title, window_start, window_end, edit_count,
                 unique_editors, human_edits, bot_edits, revert_count,
-                net_byte_delta, edit_velocity
-            ) VALUES (
-                %(wiki)s, %(page_id)s, %(page_title)s, %(window_start)s, %(window_end)s,
-                %(edit_count)s, %(unique_editors)s, %(human_edits)s, %(bot_edits)s,
-                %(revert_count)s, %(net_byte_delta)s, %(edit_velocity)s
-            )
+                net_byte_delta, edit_velocity, provenance_id
+            ) VALUES %s
             ON CONFLICT (wiki, page_title, window_start, window_end) DO UPDATE SET
                 edit_count = EXCLUDED.edit_count,
                 unique_editors = EXCLUDED.unique_editors,
@@ -279,44 +311,92 @@ class Database:
                 bot_edits = EXCLUDED.bot_edits,
                 revert_count = EXCLUDED.revert_count,
                 net_byte_delta = EXCLUDED.net_byte_delta,
-                edit_velocity = EXCLUDED.edit_velocity
+                edit_velocity = EXCLUDED.edit_velocity,
+                provenance_id = COALESCE(EXCLUDED.provenance_id, page_activity_windows.provenance_id)
         """
-        self._executemany(query, rows)
+        tuples = [
+            (
+                r["wiki"],
+                r.get("page_id"),
+                r["page_title"],
+                r["window_start"],
+                r["window_end"],
+                r["edit_count"],
+                r.get("unique_editors", 0),
+                r.get("human_edits", 0),
+                r.get("bot_edits", 0),
+                r.get("revert_count", 0),
+                r.get("net_byte_delta", 0),
+                r.get("edit_velocity", 0.0),
+                r.get("provenance_id"),
+            )
+            for r in rows
+        ]
+        self._execute_values(query, tuples, page_size=page_size)
 
-    def insert_anomaly_events(self, rows: Sequence[dict[str, Any]]) -> None:
+    def insert_anomaly_events(self, rows: Sequence[dict[str, Any]], page_size: int = 50) -> None:
         if not rows:
             return
         query = """
             INSERT INTO anomaly_events (
                 wiki, page_id, page_title, window_start, window_end, edit_count,
                 unique_editors, human_edits, bot_edits, baseline_median,
-                baseline_mad, anomaly_score, anomaly_type, threshold_used
-            ) VALUES (
-                %(wiki)s, %(page_id)s, %(page_title)s, %(window_start)s, %(window_end)s,
-                %(edit_count)s, %(unique_editors)s, %(human_edits)s, %(bot_edits)s,
-                %(baseline_median)s, %(baseline_mad)s, %(anomaly_score)s,
-                %(anomaly_type)s, %(threshold_used)s
-            )
+                baseline_mad, anomaly_score, anomaly_type, threshold_used, provenance_id
+            ) VALUES %s
             ON CONFLICT (wiki, page_title, window_start, window_end) DO NOTHING
         """
-        self._executemany(query, rows)
+        tuples = [
+            (
+                r["wiki"],
+                r.get("page_id"),
+                r["page_title"],
+                r["window_start"],
+                r["window_end"],
+                r["edit_count"],
+                r.get("unique_editors", 0),
+                r.get("human_edits", 0),
+                r.get("bot_edits", 0),
+                r.get("baseline_median"),
+                r.get("baseline_mad"),
+                r.get("anomaly_score"),
+                r["anomaly_type"],
+                r.get("threshold_used"),
+                r.get("provenance_id"),
+            )
+            for r in rows
+        ]
+        self._execute_values(query, tuples, page_size=page_size)
 
-    def insert_edit_war_signals(self, rows: Sequence[dict[str, Any]]) -> None:
+    def insert_edit_war_signals(self, rows: Sequence[dict[str, Any]], page_size: int = 50) -> None:
         if not rows:
             return
         query = """
             INSERT INTO edit_war_signals (
                 wiki, page_id, page_title, window_start, window_end,
                 mutual_revert_count, editor_a, editor_b, total_reverts,
-                edit_burst_count, conflict_score, flag
-            ) VALUES (
-                %(wiki)s, %(page_id)s, %(page_title)s, %(window_start)s, %(window_end)s,
-                %(mutual_revert_count)s, %(editor_a)s, %(editor_b)s, %(total_reverts)s,
-                %(edit_burst_count)s, %(conflict_score)s, %(flag)s
-            )
+                edit_burst_count, conflict_score, flag, provenance_id
+            ) VALUES %s
             ON CONFLICT (wiki, page_title, window_start, window_end) DO NOTHING
         """
-        self._executemany(query, rows)
+        tuples = [
+            (
+                r["wiki"],
+                r.get("page_id"),
+                r["page_title"],
+                r["window_start"],
+                r["window_end"],
+                r.get("mutual_revert_count", 0),
+                r.get("editor_a"),
+                r.get("editor_b"),
+                r.get("total_reverts", 0),
+                r.get("edit_burst_count", 0),
+                r.get("conflict_score", 0.0),
+                bool(r.get("flag", False)),
+                r.get("provenance_id"),
+            )
+            for r in rows
+        ]
+        self._execute_values(query, tuples, page_size=page_size)
 
     def upsert_user_aggregates(self, rows: Sequence[dict[str, Any]]) -> None:
         if not rows:

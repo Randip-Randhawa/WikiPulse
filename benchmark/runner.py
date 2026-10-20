@@ -118,6 +118,14 @@ def _rate(count: float, seconds: float) -> Optional[float]:
 
 
 def run_ingestion_stage(payloads: list[str], settings: Settings) -> tuple[dict[str, Any], list[WikipediaEvent]]:
+    if settings.wikimedia.wiki_filter and BENCHMARK_WIKI not in settings.wikimedia.wiki_filter:
+        settings = replace(
+            settings,
+            wikimedia=replace(
+                settings.wikimedia,
+                wiki_filter=settings.wikimedia.wiki_filter + [BENCHMARK_WIKI],
+            ),
+        )
     publisher = InMemoryPublisher()
     consumer = WikimediaSSEConsumer(settings, publisher)
     durations = []

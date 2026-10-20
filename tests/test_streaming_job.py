@@ -214,6 +214,7 @@ def test_edit_event_row_keeps_kafka_lineage_and_utc_times():
         "event_id": "e1", "timestamp": WINDOW_START.timestamp(), "wiki": "enwiki", "event_type": "edit",
         "page_title": "Page", "ingestion_timestamp": WINDOW_START.timestamp() + 2,
         "kafka_partition": 2, "kafka_offset": 1234,
+        "user": "Alice", "is_bot": False, "comment": "test comment",
     }
 
     event_row = to_edit_event_row(row)
@@ -222,3 +223,21 @@ def test_edit_event_row_keeps_kafka_lineage_and_utc_times():
     assert event_row["ingestion_time"] == WINDOW_START + timedelta(seconds=2)
     assert (event_row["kafka_partition"], event_row["kafka_offset"]) == (2, 1234)
     assert event_row["is_bot"] is False
+    assert event_row["provenance_id"] is not None
+    assert "part-2:off-1234" in event_row["provenance_id"]
+    assert event_row["user_type"] == "REGISTERED"
+    assert event_row["comment_length"] == 12
+
+
+def test_evaluate_windows_propagates_provenance_id():
+    settings = make_settings()
+    store = PageHistoryStore(settings.anomaly)
+    rows = [window_row("Page", 0, [
+        {"user": "Alice", "revision_id": 1, "is_bot": False, "is_revert": False,
+         "provenance_id": "ingest-node-01:2026-10-04T12:00:00Z:part-1:off-100", "byte_length_delta": 10,
+         "timestamp": WINDOW_START.timestamp()},
+    ])]
+
+    evaluation = evaluate_windows(rows, settings, store, window_minutes=5)
+    assert len(evaluation.activity_rows) == 1
+    assert evaluation.activity_rows[0]["provenance_id"] == "ingest-node-01:2026-10-04T12:00:00Z:part-1:off-100"

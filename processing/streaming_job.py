@@ -52,6 +52,7 @@ from common.config import Settings, SparkConfig, get_settings
 from common.logging_setup import configure_logging
 from common.stats import MILLISECONDS_PER_SECOND, summarize_ms
 from enrichment.liftwing_client import LiftWingClient, RevisionScoreRequest
+from ingestion.normalizer import classify_user_type, make_provenance_id
 from processing.aggregations import PageWindowEvent, aggregate_page_window
 from processing.anomaly_detector import PageHistoryStore
 from processing.edit_war_detector import EditRecord, detect_edit_war
@@ -80,6 +81,10 @@ EVENT_SCHEMA = StructType([
     StructField("is_revert", BooleanType(), nullable=True),
     StructField("revert_target_revision_id", LongType(), nullable=True),
     StructField("ingestion_timestamp", DoubleType(), nullable=True),
+    StructField("provenance_id", StringType(), nullable=True),
+    StructField("user_type", StringType(), nullable=True),
+    StructField("is_minor", BooleanType(), nullable=True),
+    StructField("comment_length", LongType(), nullable=True),
 ])
 
 # Fields EVENT_SCHEMA marks non-nullable; a Kafka message missing any of
@@ -305,6 +310,7 @@ def build_windowed_aggregation(parsed_df: DataFrame, spark_config: SparkConfig) 
                 F.struct(
                     "user", "revision_id", "is_bot", "is_revert",
                     "revert_target_revision_id", "byte_length_delta", "timestamp",
+                    "provenance_id",
                 )
             ).alias("records"),
         )
@@ -335,6 +341,28 @@ def _utc_from_epoch(seconds: Optional[float]) -> Optional[datetime]:
 def to_edit_event_row(row: dict[str, Any]) -> dict[str, Any]:
     """Shape one parsed Kafka row as an `edit_events` / raw_events record.
     Times are taken from the epoch fields so they are UTC-aware."""
+    k_part = row.get("kafka_partition")
+    k_off = row.get("kafka_offset")
+    prov_id = row.get("provenance_id")
+    if prov_id and k_part is not None and k_off is not None:
+        parts = prov_id.rsplit(":", 2)
+        if len(parts) == 3 and parts[1].startswith("part-") and parts[2].startswith("off-"):
+            prov_id = f"{parts[0]}:part-{k_part}:off-{k_off}"
+        elif len(parts) == 2:
+            prov_id = f"{prov_id}:part-{k_part}:off-{k_off}"
+    elif not prov_id and k_part is not None and k_off is not None:
+        ingest_time_iso = (
+            _utc_from_epoch(row.get("ingestion_timestamp")).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+            if row.get("ingestion_timestamp")
+            else None
+        )
+        prov_id = make_provenance_id(partition=k_part, offset=k_off, ingest_epoch=ingest_time_iso)
+
+    comment = row.get("comment")
+    comment_len = row.get("comment_length")
+    if comment_len is None and comment is not None:
+        comment_len = len(comment)
+
     return {
         "event_id": row["event_id"],
         "event_time": _utc_from_epoch(row["timestamp"]),
@@ -348,15 +376,19 @@ def to_edit_event_row(row: dict[str, Any]) -> dict[str, Any]:
         "user": row.get("user"),
         "user_id": row.get("user_id"),
         "is_bot": bool(row.get("is_bot") or False),
-        "comment": row.get("comment"),
+        "comment": comment,
         "byte_length_new": row.get("byte_length_new"),
         "byte_length_old": row.get("byte_length_old"),
         "byte_length_delta": row.get("byte_length_delta"),
         "is_revert": bool(row.get("is_revert") or False),
         "revert_target_revision_id": row.get("revert_target_revision_id"),
         "ingestion_time": _utc_from_epoch(row.get("ingestion_timestamp")),
-        "kafka_partition": row.get("kafka_partition"),
-        "kafka_offset": row.get("kafka_offset"),
+        "kafka_partition": k_part,
+        "kafka_offset": k_off,
+        "provenance_id": prov_id,
+        "user_type": row.get("user_type") or classify_user_type(row.get("user"), bool(row.get("is_bot") or False)),
+        "is_minor": bool(row.get("is_minor") or False),
+        "comment_length": comment_len or 0,
     }
 
 
@@ -461,6 +493,9 @@ def evaluate_windows(
         wiki = row["wiki"]
         page_title = row["page_title"]
         records_raw = row.get("records") or []
+        window_prov_id = None
+        if records_raw:
+            window_prov_id = records_raw[-1].get("provenance_id") or records_raw[0].get("provenance_id")
 
         window_events = [
             PageWindowEvent(
@@ -486,6 +521,7 @@ def evaluate_windows(
             "revert_count": metrics_result.revert_count,
             "net_byte_delta": metrics_result.net_byte_delta,
             "edit_velocity": metrics_result.edit_velocity,
+            "provenance_id": window_prov_id,
         })
 
         anomaly_result = history_store.evaluate_and_record(
@@ -507,6 +543,7 @@ def evaluate_windows(
                 "anomaly_score": anomaly_result.anomaly_score,
                 "anomaly_type": anomaly_result.anomaly_type,
                 "threshold_used": anomaly_result.threshold_used,
+                "provenance_id": window_prov_id,
             })
 
         edit_records = [
@@ -535,6 +572,7 @@ def evaluate_windows(
                 "edit_burst_count": war_result.edit_burst_count,
                 "conflict_score": war_result.conflict_score,
                 "flag": war_result.flag,
+                "provenance_id": window_prov_id,
             })
 
         # Sample at most one revision per page/window for Lift Wing
