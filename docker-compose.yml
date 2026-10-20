@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   # ---------------------------------------------------------------------
   # Kafka (KRaft mode -- no separate Zookeeper container needed)

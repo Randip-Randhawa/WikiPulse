@@ -45,6 +45,11 @@ class WikipediaEvent:
     revert_target_revision_id: Optional[int] = None
 
     ingestion_timestamp: Optional[float] = None
+    provenance_id: Optional[str] = None
+    user_type: Optional[str] = None  # "BOT" | "ANONYMOUS" | "REGISTERED"
+    is_minor: bool = False
+    comment_length: Optional[int] = None
+    is_large_jump: bool = False
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), separators=(",", ":"), ensure_ascii=False)
