@@ -11,7 +11,14 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass
+from enum import Enum
 from typing import Any, Optional
+
+
+class UserType(str, Enum):
+    BOT = "BOT"
+    ANONYMOUS = "ANONYMOUS"
+    REGISTERED = "REGISTERED"
 
 
 @dataclass
@@ -45,14 +52,51 @@ class WikipediaEvent:
     revert_target_revision_id: Optional[int] = None
 
     ingestion_timestamp: Optional[float] = None
+    processing_timestamp: Optional[float] = None
     provenance_id: Optional[str] = None
     user_type: Optional[str] = None  # "BOT" | "ANONYMOUS" | "REGISTERED"
     is_minor: bool = False
     comment_length: Optional[int] = None
     is_large_jump: bool = False
 
+    @property
+    def ingestion_latency_ms(self) -> Optional[float]:
+        """T_ingest - T_event in milliseconds."""
+        if self.ingestion_timestamp is not None:
+            return round((self.ingestion_timestamp - self.timestamp) * 1000, 3)
+        return None
+
+    @property
+    def compute_latency_ms(self) -> Optional[float]:
+        """T_proc - T_ingest in milliseconds."""
+        if self.processing_timestamp is not None and self.ingestion_timestamp is not None:
+            proc_ts = (
+                self.processing_timestamp.timestamp()
+                if hasattr(self.processing_timestamp, "timestamp")
+                else float(self.processing_timestamp)
+            )
+            return round((proc_ts - self.ingestion_timestamp) * 1000, 3)
+        return None
+
+    @property
+    def end_to_end_latency_ms(self) -> Optional[float]:
+        """T_proc - T_event in milliseconds."""
+        if self.processing_timestamp is not None:
+            proc_ts = (
+                self.processing_timestamp.timestamp()
+                if hasattr(self.processing_timestamp, "timestamp")
+                else float(self.processing_timestamp)
+            )
+            return round((proc_ts - self.timestamp) * 1000, 3)
+        return None
+
     def to_json(self) -> str:
-        return json.dumps(asdict(self), separators=(",", ":"), ensure_ascii=False)
+        d = asdict(self)
+        if hasattr(self.processing_timestamp, "timestamp"):
+            d["processing_timestamp"] = self.processing_timestamp.timestamp()
+        if hasattr(self.user_type, "value"):
+            d["user_type"] = self.user_type.value
+        return json.dumps(d, separators=(",", ":"), ensure_ascii=False)
 
     @staticmethod
     def from_json(payload: str) -> "WikipediaEvent":

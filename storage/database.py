@@ -259,7 +259,8 @@ class Database:
                 is_bot, comment, byte_length_new, byte_length_old,
                 byte_length_delta, is_revert, revert_target_revision_id,
                 ingestion_time, kafka_partition, kafka_offset,
-                provenance_id, user_type, is_minor, comment_length
+                provenance_id, user_type, is_minor, comment_length,
+                processing_time
             ) VALUES %s
             ON CONFLICT (event_id, event_time) DO NOTHING
         """
@@ -290,6 +291,7 @@ class Database:
                 r.get("user_type") or "REGISTERED",
                 bool(r.get("is_minor") or False),
                 r.get("comment_length") or (len(r["comment"]) if r.get("comment") else 0),
+                r.get("processing_time"),
             )
             for r in rows
         ]

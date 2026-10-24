@@ -57,3 +57,13 @@ class TestWikipediaEventJsonRoundTrip:
         assert data["event_id"] == "abc-123"
         assert data["wiki"] == "enwiki"
         assert data["is_bot"] is False
+
+    def test_latency_waterfall_auditing(self):
+        event = _sample_event(
+            timestamp=100.0,
+            ingestion_timestamp=100.050,
+            processing_timestamp=100.120,
+        )
+        assert event.ingestion_latency_ms == 50.0
+        assert event.compute_latency_ms == 70.0
+        assert event.end_to_end_latency_ms == 120.0

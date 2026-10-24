@@ -227,6 +227,7 @@ def test_edit_event_row_keeps_kafka_lineage_and_utc_times():
     assert "part-2:off-1234" in event_row["provenance_id"]
     assert event_row["user_type"] == "REGISTERED"
     assert event_row["comment_length"] == 12
+    assert event_row["processing_time"] is not None
 
 
 def test_evaluate_windows_propagates_provenance_id():

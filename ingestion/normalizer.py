@@ -19,13 +19,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Optional
 
-from common.models import WikipediaEvent
-
-# User classification enum matching Lab 6-8 canonical data schema.
-class UserType(str, Enum):
-    BOT = "BOT"
-    ANONYMOUS = "ANONYMOUS"
-    REGISTERED = "REGISTERED"
+from common.models import UserType, WikipediaEvent
 
 
 # Regex to isolate anonymous editors based on IPv4 or IPv6 address.

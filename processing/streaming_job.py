@@ -389,6 +389,7 @@ def to_edit_event_row(row: dict[str, Any]) -> dict[str, Any]:
         "user_type": row.get("user_type") or classify_user_type(row.get("user"), bool(row.get("is_bot") or False)),
         "is_minor": bool(row.get("is_minor") or False),
         "comment_length": comment_len or 0,
+        "processing_time": _utc_from_epoch(row.get("processing_timestamp")) or datetime.now(timezone.utc),
     }
 
 

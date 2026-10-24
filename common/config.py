@@ -68,8 +68,14 @@ class WikimediaConfig:
 class KafkaConfig:
     bootstrap_servers: str = field(default_factory=lambda: _get_str("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"))
     topic_edits: str = field(default_factory=lambda: _get_str("KAFKA_TOPIC_EDITS", "wikipedia-edits"))
+    topic_canonical: str = field(
+        default_factory=lambda: _get_str("KAFKA_TOPIC_CANONICAL", "wikipedia.edits.canonical")
+    )
     topic_dead_letter: str = field(
         default_factory=lambda: _get_str("KAFKA_TOPIC_DEAD_LETTER", "wikipedia-edits-dlq"))
+    topic_dlq_canonical: str = field(
+        default_factory=lambda: _get_str("KAFKA_TOPIC_DLQ_CANONICAL", "wikipedia.edits.dlq")
+    )
     consumer_group: str = field(default_factory=lambda: _get_str("KAFKA_CONSUMER_GROUP", "wikipulse-spark"))
     producer_acks: str = field(default_factory=lambda: _get_str("KAFKA_PRODUCER_ACKS", "all"))
     producer_linger_ms: int = field(default_factory=lambda: _get_int("KAFKA_PRODUCER_LINGER_MS", 50))
@@ -206,6 +212,24 @@ class BenchmarkConfig:
 
 
 @dataclass(frozen=True)
+class StreamConsumerConfig:
+    """Tunables for the standalone stateful stream consumer worker."""
+
+    window_duration_seconds: float = field(
+        default_factory=lambda: _get_float("STREAM_WINDOW_DURATION_SECONDS", 300.0)
+    )
+    slide_interval_seconds: float = field(
+        default_factory=lambda: _get_float("STREAM_SLIDE_INTERVAL_SECONDS", 30.0)
+    )
+    watermark_delay_seconds: float = field(
+        default_factory=lambda: _get_float("STREAM_WATERMARK_DELAY_SECONDS", 120.0)
+    )
+    host_node: str = field(
+        default_factory=lambda: _get_str("STREAM_HOST_NODE", "stream-worker-01")
+    )
+
+
+@dataclass(frozen=True)
 class LoggingConfig:
     level: str = field(default_factory=lambda: _get_str("LOG_LEVEL", "INFO"))
 
@@ -225,6 +249,7 @@ class Settings:
     parquet: ParquetConfig = field(default_factory=ParquetConfig)
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
     benchmark: BenchmarkConfig = field(default_factory=BenchmarkConfig)
+    stream_consumer: StreamConsumerConfig = field(default_factory=StreamConsumerConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
 

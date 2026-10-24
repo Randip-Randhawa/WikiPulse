@@ -148,9 +148,11 @@ def render_markdown(results: dict) -> str:
             f"{_fmt(detection['micro_batches'])} micro-batches, duplicates {detection['duplicate_windows']} |",
         ]
         for dataset, parquet in stages["parquet"].items():
+            json_pct = parquet.get("json_reduction_pct")
+            json_note = f", JSON reduction {json_pct}% (target >60%)" if json_pct is not None else ""
             lines.append(
                 f"| Parquet {dataset} | {_fmt(parquet['rows_per_sec'])} rows/s | {_fmt(parquet['files'])} files, "
-                f"{_fmt(parquet['file_bytes'])} bytes, Snappy ratio {_fmt(parquet['compression_ratio'])} |")
+                f"{_fmt(parquet['file_bytes'])} bytes, Snappy ratio {_fmt(parquet['compression_ratio'])}{json_note} |")
         if "postgres" in stages:
             for table in ("edit_events", "page_activity_windows"):
                 postgres = stages["postgres"][table]

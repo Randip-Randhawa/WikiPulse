@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS edit_events (
     user_type               VARCHAR(16) NOT NULL DEFAULT 'REGISTERED',
     is_minor                BOOLEAN NOT NULL DEFAULT FALSE,
     comment_length          SMALLINT NOT NULL DEFAULT 0,
+    processing_time         TIMESTAMPTZ,  -- clock time when sliding window evaluation concludes
     PRIMARY KEY (id, event_time),
     UNIQUE (event_id, event_time)
 ) PARTITION BY RANGE (event_time);
@@ -231,6 +232,7 @@ ALTER TABLE edit_events ADD COLUMN IF NOT EXISTS provenance_id VARCHAR(128);
 ALTER TABLE edit_events ADD COLUMN IF NOT EXISTS user_type VARCHAR(16) NOT NULL DEFAULT 'REGISTERED';
 ALTER TABLE edit_events ADD COLUMN IF NOT EXISTS is_minor BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE edit_events ADD COLUMN IF NOT EXISTS comment_length SMALLINT NOT NULL DEFAULT 0;
+ALTER TABLE edit_events ADD COLUMN IF NOT EXISTS processing_time TIMESTAMPTZ;
 
 ALTER TABLE page_activity_windows ADD COLUMN IF NOT EXISTS provenance_id VARCHAR(128);
 ALTER TABLE anomaly_events ADD COLUMN IF NOT EXISTS provenance_id VARCHAR(128);
@@ -248,6 +250,10 @@ SELECT
     user_type,
     event_time AS event_timestamp,
     COALESCE(ingestion_time, event_time) AS ingest_timestamp,
+    COALESCE(processing_time, ingested_at) AS processing_timestamp,
+    ROUND(CAST(EXTRACT(EPOCH FROM (COALESCE(ingestion_time, event_time) - event_time)) * 1000 AS numeric), 3) AS ingestion_latency_ms,
+    ROUND(CAST(EXTRACT(EPOCH FROM (COALESCE(processing_time, ingested_at) - COALESCE(ingestion_time, event_time))) * 1000 AS numeric), 3) AS compute_latency_ms,
+    ROUND(CAST(EXTRACT(EPOCH FROM (COALESCE(processing_time, ingested_at) - event_time)) * 1000 AS numeric), 3) AS end_to_end_latency_ms,
     COALESCE(byte_length_delta, 0) AS byte_delta,
     is_minor,
     is_revert,

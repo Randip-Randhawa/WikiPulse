@@ -48,6 +48,7 @@ class ParquetWriter:
         rows: Sequence[dict[str, Any]],
         time_field: str,
         wiki_field: str = "wiki",
+        hierarchical: bool = False,
     ) -> ParquetWriteStats:
         """Append `rows` to the appropriate wiki/date/hour partitions.
 
@@ -67,9 +68,20 @@ class ParquetWriter:
         hour_starts = df[time_field].dt.floor("h")
 
         for (wiki, hour_start), group in df.groupby([wiki_field, hour_starts]):
-            partition_dir = (
-                self._base_path / dataset / f"wiki={wiki}" / f"date={hour_start:%Y-%m-%d}" / f"hour={hour_start:%H}"
-            )
+            if hierarchical or dataset == "lake":
+                prefix = self._base_path if dataset == "lake" else self._base_path / dataset
+                partition_dir = (
+                    prefix
+                    / f"wiki={wiki}"
+                    / f"year={hour_start:%Y}"
+                    / f"month={hour_start:%m}"
+                    / f"day={hour_start:%d}"
+                    / f"hour={hour_start:%H}"
+                )
+            else:
+                partition_dir = (
+                    self._base_path / dataset / f"wiki={wiki}" / f"date={hour_start:%Y-%m-%d}" / f"hour={hour_start:%H}"
+                )
             partition_dir.mkdir(parents=True, exist_ok=True)
             file_path = partition_dir / f"part-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}.parquet"
             # pyarrow hands back the footer it wrote, which saves re-opening the file for sizes.
@@ -88,3 +100,20 @@ class ParquetWriter:
                     stats.compressed_bytes += column.total_compressed_size
             logger.debug("Wrote %d rows to %s", len(group), file_path)
         return stats
+
+    def write_lake_records(
+        self,
+        rows: Sequence[dict[str, Any]],
+        time_field: str = "event_time",
+        wiki_field: str = "wiki",
+    ) -> ParquetWriteStats:
+        """Export records to analytical lake hierarchical date partition layout:
+        <base_path>/wiki=<wiki>/year=YYYY/month=MM/day=DD/hour=HH/
+        """
+        return self.write_records(
+            dataset="lake",
+            rows=rows,
+            time_field=time_field,
+            wiki_field=wiki_field,
+            hierarchical=True,
+        )

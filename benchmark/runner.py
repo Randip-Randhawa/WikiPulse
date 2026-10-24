@@ -31,6 +31,7 @@ throughput. A running pipeline records its own end-to-end latency in
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import math
 import os
@@ -137,17 +138,21 @@ def run_ingestion_stage(payloads: list[str], settings: Settings) -> tuple[dict[s
     wall_seconds = time.perf_counter() - started
 
     metrics = consumer.metrics
+    rate = _rate(len(payloads), wall_seconds)
+    dlq_rate = round(publisher.dead_letters / len(payloads), 4) if payloads else 0.0
     result = {
         "events_in": len(payloads),
         "accepted": metrics.events_parsed,
         "filtered": metrics.events_ignored,
         "rejected": metrics.events_rejected,
         "dead_lettered": publisher.dead_letters,
-        "dead_letter_rate": round(publisher.dead_letters / len(payloads), 4),
+        "dead_letter_rate": dlq_rate,
         "wall_seconds": round(wall_seconds, 3),
-        "events_per_sec": _rate(len(payloads), wall_seconds),
+        "events_per_sec": rate,
         "per_event_ms": summarize_ms(durations),
         "mean_message_bytes": round(publisher.serialized_bytes / len(publisher.events), 1) if publisher.events else None,
+        "burst_sla_met": rate >= 780.0,
+        "dlq_sla_met": dlq_rate <= 0.001,
     }
     return result, publisher.events
 
@@ -255,14 +260,23 @@ def run_parquet_stage(
     ):
         totals = ParquetWriteStats()
         durations = []
+        raw_json_bytes = sum(len(json.dumps(r, default=str).encode("utf-8")) for r in rows)
         for offset in range(0, len(rows), batch_size):
             started = time.perf_counter()
             stats = writer.write_records(dataset, rows[offset:offset + batch_size], time_field=time_field)
             durations.append(time.perf_counter() - started)
             for name, value in asdict(stats).items():
                 setattr(totals, name, getattr(totals, name) + value)
+
+        json_reduction = (
+            round((1.0 - totals.file_bytes / raw_json_bytes) * 100, 1)
+            if raw_json_bytes > 0 and totals.file_bytes > 0
+            else None
+        )
         results[dataset] = {
             **asdict(totals),
+            "raw_json_bytes": raw_json_bytes,
+            "json_reduction_pct": json_reduction,
             "compression_ratio": (
                 round(totals.uncompressed_bytes / totals.compressed_bytes, 2) if totals.compressed_bytes else None
             ),
@@ -296,11 +310,14 @@ def run_postgres_stage(
                 started = time.perf_counter()
                 write(rows[offset:offset + batch_size])
                 durations.append(time.perf_counter() - started)
+            summary = summarize_ms(durations)
             results[name] = {
                 "rows": len(rows),
                 "batches": len(durations),
                 "rows_per_sec": _rate(len(rows), sum(durations)),
-                "batch_ms": summarize_ms(durations),
+                "batch_ms": summary,
+                "target_batch_ms": 38.0,
+                "target_met": (summary.get("p50", 999.0) <= 38.0) if summary else False,
             }
     finally:
         with psycopg2.connect(settings.postgres.dsn) as conn, conn.cursor() as cur:

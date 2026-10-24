@@ -72,3 +72,47 @@ def test_writing_no_rows_creates_nothing(tmp_path):
 
     assert stats.rows == 0
     assert list(tmp_path.rglob("*.parquet")) == []
+
+
+def test_hierarchical_lake_partitioning(tmp_path):
+    writer = ParquetWriter(ParquetConfig(base_path=str(tmp_path)))
+    rows = [
+        {
+            "wiki": "enwiki",
+            "event_id": "1",
+            "event_time": datetime(2026, 10, 4, 12, 30, tzinfo=timezone.utc),
+            "byte_length_delta": -420,
+            "is_revert": True,
+        }
+    ]
+
+    stats = writer.write_lake_records(rows, time_field="event_time")
+    assert stats.rows == 1
+
+    [file_path] = tmp_path.rglob("*.parquet")
+    posix_path = file_path.as_posix()
+    assert "wiki=enwiki/year=2026/month=10/day=04/hour=12" in posix_path
+
+
+def test_duckdb_subcolumn_scan(tmp_path):
+    from storage.parquet_reader import scan_subcolumns_duckdb
+
+    writer = ParquetWriter(ParquetConfig(base_path=str(tmp_path)))
+    rows = [
+        {
+            "wiki": "enwiki",
+            "event_id": f"e{i}",
+            "event_time": datetime(2026, 10, 4, 12, i, tzinfo=timezone.utc),
+            "byte_delta": i * 10,
+            "is_revert": (i % 2 == 0),
+            "heavy_user_text": "text " * 100,
+        }
+        for i in range(10)
+    ]
+
+    writer.write_lake_records(rows, time_field="event_time")
+
+    df = scan_subcolumns_duckdb(tmp_path, columns=["byte_delta", "is_revert"])
+    assert list(df.columns) == ["byte_delta", "is_revert"]
+    assert len(df) == 10
+    assert df["byte_delta"].tolist() == [i * 10 for i in range(10)]
