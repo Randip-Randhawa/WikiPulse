@@ -1,6 +1,6 @@
 """Tests for processing.edit_war_detector: reciprocal (mutual) revert
-detection, as distinct from a simple revert-count heuristic (Lab 2 Section
-6/19: high revert counts alone do not constitute an edit war)."""
+detection, as distinct from a simple revert-count heuristic (high revert
+counts alone do not constitute an edit war)."""
 
 from __future__ import annotations
 
@@ -134,3 +134,27 @@ class TestDetectEditWar:
         ]
         result = detect_edit_war(records, config)
         assert result.edit_burst_count == 2
+
+    def test_burst_of_shrinking_edits_without_reverts_is_not_flagged(self):
+        config = make_config(min_edits_in_window=4, score_burst_weight=0.5, flag_score_threshold=3.0)
+        records = [rec(f"Editor{n}", revision_id=n, delta=-20, ts=n) for n in range(8)]
+
+        result = detect_edit_war(records, config)
+
+        assert result.conflict_score >= config.flag_score_threshold
+        assert result.flag is False
+
+    def test_one_reciprocal_exchange_with_a_burst_reaches_the_score_threshold(self):
+        config = make_config(mutual_revert_threshold=3, min_edits_in_window=4,
+                             score_mutual_weight=2.0, score_burst_weight=0.5, flag_score_threshold=3.0)
+        records = [
+            rec("Alice", revision_id=1, ts=0),
+            rec("Bob", revision_id=2, is_revert=True, target=1, delta=-30, ts=1),
+            rec("Alice", revision_id=3, is_revert=True, target=2, delta=-30, ts=2),
+            rec("Carol", revision_id=4, delta=-5, ts=3),
+        ]
+
+        result = detect_edit_war(records, config)
+
+        assert result.mutual_revert_count == 2
+        assert result.flag is True

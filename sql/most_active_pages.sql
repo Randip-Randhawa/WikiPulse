@@ -1,14 +1,15 @@
--- Most active pages in the last N hours, by total edit count across windows.
--- Adjust the interval as needed.
+-- Most active pages in the last 24 hours, by number of edits. Counted from
+-- edit_events: page_activity_windows overlap (each edit appears in every
+-- sliding window that covers it), so summing their edit_count overcounts.
 SELECT
     wiki,
     page_title,
-    SUM(edit_count)        AS total_edits,
-    SUM(unique_editors)    AS total_unique_editor_observations,
-    MAX(edit_velocity)     AS peak_edit_velocity,
-    MAX(window_end)        AS most_recent_window
-FROM page_activity_windows
-WHERE window_start >= now() - interval '24 hours'
+    COUNT(*)                     AS total_edits,
+    COUNT(DISTINCT "user")       AS distinct_editors,
+    COUNT(*) FILTER (WHERE is_revert) AS reverts,
+    MAX(event_time)              AS most_recent_edit
+FROM edit_events
+WHERE event_time >= now() - interval '24 hours'
 GROUP BY wiki, page_title
 ORDER BY total_edits DESC
 LIMIT 25;

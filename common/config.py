@@ -88,8 +88,9 @@ class SparkConfig:
 
 @dataclass(frozen=True)
 class AnomalyConfig:
-    """Tunables for the median/MAD anomaly detector and its count-based
-    fallback for pages with insufficient history (see Lab 2, Section 5)."""
+    """Tunables for the median/MAD anomaly detector, its count-based
+    fallback for pages with insufficient history, and the per-page history
+    kept in memory."""
 
     mad_threshold: float = field(default_factory=lambda: _get_float("ANOMALY_MAD_THRESHOLD", 3.5))
     min_history_windows: int = field(default_factory=lambda: _get_int("ANOMALY_MIN_HISTORY_WINDOWS", 8))
@@ -97,7 +98,20 @@ class AnomalyConfig:
         default_factory=lambda: _get_int("ANOMALY_FALLBACK_EDIT_COUNT_THRESHOLD", 15))
     history_lookback_windows: int = field(
         default_factory=lambda: _get_int("ANOMALY_HISTORY_LOOKBACK_WINDOWS", 48))
-    mad_epsilon: float = field(default_factory=lambda: _get_float("ANOMALY_MAD_EPSILON", 1e-6))
+    mad_epsilon: float = field(default_factory=lambda: _get_float("ANOMALY_MAD_EPSILON", 1.0))
+    history_ttl_seconds: float = field(
+        default_factory=lambda: _get_float("ANOMALY_HISTORY_TTL_SECONDS", 7200.0))
+    history_cleanup_interval_seconds: float = field(
+        default_factory=lambda: _get_float("ANOMALY_HISTORY_CLEANUP_INTERVAL_SECONDS", 60.0))
+
+    def __post_init__(self) -> None:
+        if self.history_ttl_seconds <= 0:
+            raise ValueError(f"ANOMALY_HISTORY_TTL_SECONDS must be positive, got {self.history_ttl_seconds}")
+        if self.history_cleanup_interval_seconds <= 0:
+            raise ValueError(
+                "ANOMALY_HISTORY_CLEANUP_INTERVAL_SECONDS must be positive, "
+                f"got {self.history_cleanup_interval_seconds}"
+            )
 
 
 @dataclass(frozen=True)
@@ -128,7 +142,21 @@ class PostgresConfig:
     database: str = field(default_factory=lambda: _get_str("POSTGRES_DB", "wikipulse"))
     user: str = field(default_factory=lambda: _get_str("POSTGRES_USER", "wikipulse"))
     password: str = field(default_factory=lambda: _get_str("POSTGRES_PASSWORD", "wikipulse_dev_password"))
-    retention_days: int = field(default_factory=lambda: _get_int("POSTGRES_RETENTION_DAYS", 14))
+    retention_hours: int = field(default_factory=lambda: _get_int("POSTGRES_RETENTION_HOURS", 72))
+    partition_horizon_days: int = field(default_factory=lambda: _get_int("POSTGRES_PARTITION_HORIZON_DAYS", 3))
+    maintenance_interval_seconds: int = field(
+        default_factory=lambda: _get_int("POSTGRES_MAINTENANCE_INTERVAL_SECONDS", 3600))
+
+    def __post_init__(self) -> None:
+        if self.retention_hours <= 0:
+            raise ValueError(f"POSTGRES_RETENTION_HOURS must be positive, got {self.retention_hours}")
+        if self.partition_horizon_days < 1:
+            raise ValueError(
+                f"POSTGRES_PARTITION_HORIZON_DAYS must be at least 1, got {self.partition_horizon_days}")
+        if self.maintenance_interval_seconds <= 0:
+            raise ValueError(
+                "POSTGRES_MAINTENANCE_INTERVAL_SECONDS must be positive, "
+                f"got {self.maintenance_interval_seconds}")
 
     @property
     def dsn(self) -> str:
@@ -158,6 +186,26 @@ class DashboardConfig:
 
 
 @dataclass(frozen=True)
+class BenchmarkConfig:
+    """Defaults for `python -m benchmark.runner`; its command-line flags
+    override them."""
+
+    events: int = field(default_factory=lambda: _get_int("BENCHMARK_EVENTS", 20000))
+    rate: float = field(default_factory=lambda: _get_float("BENCHMARK_RATE", 50.0))
+    seed: int = field(default_factory=lambda: _get_int("BENCHMARK_SEED", 42))
+    batch_size: int = field(default_factory=lambda: _get_int("BENCHMARK_BATCH_SIZE", 500))
+    output_dir: str = field(default_factory=lambda: _get_str("BENCHMARK_OUTPUT_DIR", "./data/benchmarks"))
+
+    def __post_init__(self) -> None:
+        if self.events <= 0:
+            raise ValueError(f"BENCHMARK_EVENTS must be positive, got {self.events}")
+        if self.rate <= 0:
+            raise ValueError(f"BENCHMARK_RATE must be positive, got {self.rate}")
+        if self.batch_size <= 0:
+            raise ValueError(f"BENCHMARK_BATCH_SIZE must be positive, got {self.batch_size}")
+
+
+@dataclass(frozen=True)
 class LoggingConfig:
     level: str = field(default_factory=lambda: _get_str("LOG_LEVEL", "INFO"))
 
@@ -176,6 +224,7 @@ class Settings:
     postgres: PostgresConfig = field(default_factory=PostgresConfig)
     parquet: ParquetConfig = field(default_factory=ParquetConfig)
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
+    benchmark: BenchmarkConfig = field(default_factory=BenchmarkConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
 

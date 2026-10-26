@@ -1,8 +1,9 @@
-"""Purge PostgreSQL rows older than POSTGRES_RETENTION_DAYS.
+"""Purge PostgreSQL rows older than POSTGRES_RETENTION_HOURS.
 
-Intended to be run periodically (e.g. via cron or a simple sleep loop) to
-keep the live-query tables bounded, since long-term history is retained in
-Parquet instead (see storage/database.py Database.purge_old_data).
+Expired daily partitions are dropped and remaining expired rows deleted;
+long-term history is retained in Parquet instead (see storage/database.py
+Database.purge_old_data). The maintenance service runs this on a schedule;
+this script runs it once:
 
     python -m scripts.purge_old_data
 """
@@ -18,8 +19,9 @@ def main() -> None:
     logger = configure_logging("scripts.purge_old_data")
     settings = get_settings()
     db = Database(settings.postgres)
-    deleted = db.purge_old_data()
-    logger.info("Purge complete: %s", deleted)
+    result = db.purge_old_data()
+    logger.info("Purge complete: dropped partitions %s, deleted rows %s",
+                result.dropped_partitions, result.deleted_rows)
 
 
 if __name__ == "__main__":

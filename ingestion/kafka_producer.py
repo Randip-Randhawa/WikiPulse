@@ -7,13 +7,14 @@ Design notes:
 - Delivery is asynchronous with a callback for logging; `flush()` is called
   on shutdown to avoid dropping buffered messages.
 - Malformed/undeliverable events are not silently dropped: delivery
-  failures are logged and counted so operators can see them on the
-  dashboard (see common metrics usage in sse_consumer.py).
+  failures are logged and counted, and sse_consumer.py writes the counts
+  to `pipeline_metrics` for the dashboard.
 """
 
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Optional
 
 from confluent_kafka import KafkaError, Message, Producer
@@ -38,6 +39,7 @@ class EventPublisher:
         })
         self.delivered_count = 0
         self.failed_count = 0
+        self.retried_count = 0
 
     def _delivery_callback(self, err: Optional[KafkaError], msg: Message) -> None:
         if err is not None:
@@ -62,6 +64,7 @@ class EventPublisher:
             self._producer.poll(0)
         except BufferError:
             logger.warning("Kafka producer queue full; flushing and retrying once")
+            self.retried_count += 1
             self._producer.flush(5)
             self._producer.produce(
                 topic=target_topic,
@@ -70,18 +73,26 @@ class EventPublisher:
                 callback=self._delivery_callback,
             )
 
-    def publish_raw_dead_letter(self, raw_payload: str, reason: str) -> None:
+    def publish_raw_dead_letter(self, raw_payload: str, reason: str, stage: str) -> bool:
         """Publish an unparseable/malformed payload to the dead-letter topic
-        for later inspection, instead of dropping it silently."""
+        for later inspection, instead of dropping it silently. `stage` names
+        the step that rejected it. Returns False if it could not be queued;
+        a dead-letter failure must never stop ingestion."""
         try:
             self._producer.produce(
                 topic=self._config.topic_dead_letter,
                 value=raw_payload.encode("utf-8", errors="replace"),
-                headers={"reason": reason.encode("utf-8")},
+                headers={
+                    "reason": reason.encode("utf-8"),
+                    "stage": stage.encode("utf-8"),
+                    "failed_at": datetime.now(timezone.utc).isoformat().encode("utf-8"),
+                },
             )
             self._producer.poll(0)
+            return True
         except Exception:  # pragma: no cover - best-effort, never fatal
             logger.exception("Failed to publish to dead-letter topic")
+            return False
 
     def flush(self, timeout: float = 10.0) -> None:
         self._producer.flush(timeout)

@@ -1,8 +1,8 @@
 """Edit-war detection based on reciprocal reverts, not raw revert counts.
 
-Per Lab 2 (project spec Section 6 and Section 19), a high revert count on a
-page does NOT by itself constitute an edit war -- a single editor reverting
-several unrelated vandalism edits looks the same in raw counts. What
+A high revert count on a page does NOT by itself constitute an edit war --
+a single editor reverting several unrelated vandalism edits looks the same
+in raw counts. What
 specifically signals a conflict is *reciprocal* behavior: editor A reverts
 editor B, and editor B later reverts editor A back, within the same
 analysis window.
@@ -59,7 +59,7 @@ def detect_edit_war(records: list[EditRecord], config: EditWarConfig) -> EditWar
     return a page-level edit-war/conflict signal.
 
     This intentionally returns a *signal* (a score + flag), not a
-    definitive judgement -- see project spec Section 6.
+    definitive judgement.
     """
     records = list(records)
     total_reverts = sum(1 for r in records if r.is_revert)
@@ -112,9 +112,11 @@ def detect_edit_war(records: list[EditRecord], config: EditWarConfig) -> EditWar
         * config.score_burst_weight
     )
 
-    flag = (
-        mutual_revert_count >= config.mutual_revert_threshold
-        or conflict_score >= config.flag_score_threshold
+    # The burst term can reach the score threshold on its own (enough
+    # shrinking edits in a busy window), so the score only flags a window
+    # that also has a reciprocal revert.
+    flag = mutual_revert_count >= config.mutual_revert_threshold or (
+        mutual_revert_count > 0 and conflict_score >= config.flag_score_threshold
     )
 
     return EditWarResult(

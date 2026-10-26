@@ -71,8 +71,11 @@ services:
     env_file: .env
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      POSTGRES_HOST: postgres
     depends_on:
       kafka:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
     restart: unless-stopped
 
@@ -94,6 +97,22 @@ services:
       - ./data:/app/data
     restart: unless-stopped
 
+  # Creates upcoming daily partitions and enforces POSTGRES_RETENTION_HOURS
+  # every POSTGRES_MAINTENANCE_INTERVAL_SECONDS. Each run is idempotent, so
+  # a restart just runs it again immediately.
+  maintenance:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.maintenance
+    container_name: wikipulse-maintenance
+    env_file: .env
+    environment:
+      POSTGRES_HOST: postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
   dashboard:
     build:
       context: .
@@ -104,6 +123,9 @@ services:
       POSTGRES_HOST: postgres
     ports:
       - "8501:8501"
+    volumes:
+      # Read-only access to the Parquet history for the long-range chart.
+      - ./data/parquet:/app/data/parquet:ro
     depends_on:
       postgres:
         condition: service_healthy

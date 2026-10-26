@@ -1,5 +1,6 @@
 -- Pages that have triggered the most activity anomalies (median/MAD or
--- count-based fallback) in the last N days.
+-- count-based fallback) within PostgreSQL's retention window (72 hours by
+-- default).
 SELECT
     wiki,
     page_title,
@@ -9,7 +10,7 @@ SELECT
     MAX(anomaly_score)                         AS peak_anomaly_score,
     MAX(window_end)                            AS most_recent_anomaly
 FROM anomaly_events
-WHERE window_start >= now() - interval '7 days'
+WHERE window_start >= now() - interval '72 hours'
 GROUP BY wiki, page_title
 ORDER BY anomaly_count DESC
 LIMIT 25;

@@ -5,6 +5,8 @@ confluent-kafka==2.5.3
 
 # --- Processing (Spark) ---
 pyspark==3.5.1
+# Driver process memory for pipeline metrics and benchmarks
+psutil==6.0.0
 
 # --- Enrichment ---
 httpx==0.27.2

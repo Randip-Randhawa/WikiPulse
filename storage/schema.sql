@@ -5,16 +5,22 @@
 -- - `edit_events` stores a *bounded, recent* window of normalized events
 --   used for dashboard drill-downs; long-term raw history lives in Parquet,
 --   not here (see storage/database.py retention/purge logic).
+-- - `edit_events` and `page_activity_windows` are range-partitioned by UTC
+--   day (see storage/partitions.py). Daily partitions are created by
+--   Database.init_schema and dropped by Database.purge_old_data, not here.
+--   Keys on these tables include the partition column, as PostgreSQL
+--   requires; an event's event_time never changes, so (event_id,
+--   event_time) still identifies one event.
 -- - `page_activity_windows`, `anomaly_events`, and `edit_war_signals` are
---   intentionally separate tables (see Lab 2 Section 19): high activity,
---   statistical anomalies, and edit-war conflict signals are distinct
---   concepts and must not be conflated.
+--   intentionally separate tables: high activity, statistical anomalies,
+--   and edit-war conflict signals are distinct concepts and a page can
+--   show any one of them without the others.
 -- - Indexes are chosen for the query patterns in sql/*.sql and the
 --   dashboard (recent-first, page-scoped, and time-range lookups).
 -- =============================================================================
 
 CREATE TABLE IF NOT EXISTS edit_events (
-    id                      BIGSERIAL PRIMARY KEY,
+    id                      BIGSERIAL,
     event_id                TEXT NOT NULL,
     event_time              TIMESTAMPTZ NOT NULL,
     wiki                    TEXT NOT NULL,
@@ -33,16 +39,26 @@ CREATE TABLE IF NOT EXISTS edit_events (
     byte_length_delta       INTEGER,
     is_revert               BOOLEAN NOT NULL DEFAULT FALSE,
     revert_target_revision_id BIGINT,
-    ingested_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (event_id)
-);
+    ingestion_time          TIMESTAMPTZ,  -- when the ingestion service normalized the event
+    kafka_partition         INTEGER,      -- with kafka_offset, where the event was read from
+    kafka_offset            BIGINT,
+    ingested_at             TIMESTAMPTZ NOT NULL DEFAULT now(),  -- when this row was written to PostgreSQL
+    PRIMARY KEY (id, event_time),
+    UNIQUE (event_id, event_time)
+) PARTITION BY RANGE (event_time);
+
+CREATE TABLE IF NOT EXISTS edit_events_default PARTITION OF edit_events DEFAULT;
 
 CREATE INDEX IF NOT EXISTS idx_edit_events_time ON edit_events (event_time DESC);
 CREATE INDEX IF NOT EXISTS idx_edit_events_page ON edit_events (wiki, page_title, event_time DESC);
 CREATE INDEX IF NOT EXISTS idx_edit_events_user ON edit_events ("user");
+-- Reverts are a small fraction of edits; the dashboard's edit-war evidence
+-- view reads only them, per page and newest first.
+CREATE INDEX IF NOT EXISTS idx_edit_events_reverts ON edit_events (wiki, page_title, event_time DESC)
+    WHERE is_revert;
 
 CREATE TABLE IF NOT EXISTS page_activity_windows (
-    id                  BIGSERIAL PRIMARY KEY,
+    id                  BIGSERIAL,
     wiki                TEXT NOT NULL,
     page_id             BIGINT,
     page_title          TEXT NOT NULL,
@@ -56,8 +72,11 @@ CREATE TABLE IF NOT EXISTS page_activity_windows (
     net_byte_delta      BIGINT NOT NULL DEFAULT 0,
     edit_velocity       DOUBLE PRECISION NOT NULL DEFAULT 0,  -- edits per minute
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (id, window_start),
     UNIQUE (wiki, page_title, window_start, window_end)
-);
+) PARTITION BY RANGE (window_start);
+
+CREATE TABLE IF NOT EXISTS page_activity_windows_default PARTITION OF page_activity_windows DEFAULT;
 
 CREATE INDEX IF NOT EXISTS idx_activity_windows_time ON page_activity_windows (window_start DESC);
 CREATE INDEX IF NOT EXISTS idx_activity_windows_page ON page_activity_windows (wiki, page_title, window_start DESC);
@@ -82,6 +101,24 @@ CREATE TABLE IF NOT EXISTS anomaly_events (
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- One row per page window. Installs created before this key existed may
+-- hold duplicates from re-emitted windows; keep the newest row of each
+-- window (the most complete count) before adding the key.
+DO $$
+BEGIN
+    IF to_regclass('uq_anomaly_events_window') IS NULL THEN
+        DELETE FROM anomaly_events older
+        USING anomaly_events newer
+        WHERE older.wiki = newer.wiki
+          AND older.page_title = newer.page_title
+          AND older.window_start = newer.window_start
+          AND older.window_end = newer.window_end
+          AND older.id < newer.id;
+        CREATE UNIQUE INDEX uq_anomaly_events_window
+            ON anomaly_events (wiki, page_title, window_start, window_end);
+    END IF;
+END $$;
+
 CREATE INDEX IF NOT EXISTS idx_anomaly_events_time ON anomaly_events (window_start DESC);
 CREATE INDEX IF NOT EXISTS idx_anomaly_events_page ON anomaly_events (wiki, page_title, window_start DESC);
 CREATE INDEX IF NOT EXISTS idx_anomaly_events_score ON anomaly_events (anomaly_score DESC);
@@ -102,6 +139,21 @@ CREATE TABLE IF NOT EXISTS edit_war_signals (
     flag                BOOLEAN NOT NULL DEFAULT FALSE,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+DO $$
+BEGIN
+    IF to_regclass('uq_edit_war_signals_window') IS NULL THEN
+        DELETE FROM edit_war_signals older
+        USING edit_war_signals newer
+        WHERE older.wiki = newer.wiki
+          AND older.page_title = newer.page_title
+          AND older.window_start = newer.window_start
+          AND older.window_end = newer.window_end
+          AND older.id < newer.id;
+        CREATE UNIQUE INDEX uq_edit_war_signals_window
+            ON edit_war_signals (wiki, page_title, window_start, window_end);
+    END IF;
+END $$;
 
 CREATE INDEX IF NOT EXISTS idx_edit_war_time ON edit_war_signals (window_start DESC);
 CREATE INDEX IF NOT EXISTS idx_edit_war_page ON edit_war_signals (wiki, page_title, window_start DESC);
@@ -152,8 +204,11 @@ CREATE TABLE IF NOT EXISTS pipeline_metrics (
     processing_latency_ms   DOUBLE PRECISION,
     throughput_per_sec      DOUBLE PRECISION,
     last_event_time         TIMESTAMPTZ,
-    error_count             BIGINT NOT NULL DEFAULT 0
+    error_count             BIGINT NOT NULL DEFAULT 0,
+    details                 JSONB  -- latest per-stage measurements; see README "Pipeline metrics"
 );
+
+ALTER TABLE pipeline_metrics ADD COLUMN IF NOT EXISTS details JSONB;
 
 CREATE INDEX IF NOT EXISTS idx_pipeline_metrics_time ON pipeline_metrics (recorded_at DESC);
 CREATE INDEX IF NOT EXISTS idx_pipeline_metrics_component ON pipeline_metrics (component, recorded_at DESC);

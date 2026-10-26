@@ -1,0 +1,13 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir \
+    psycopg2-binary==2.9.9 \
+    python-dotenv==1.0.1
+
+COPY common/ ./common/
+COPY storage/ ./storage/
+COPY scripts/maintain_partitions.py ./scripts/
+
+CMD ["python", "-m", "scripts.maintain_partitions", "--loop"]

@@ -11,6 +11,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir \
     pyspark==3.5.1 \
+    psutil==6.0.0 \
     psycopg2-binary==2.9.9 \
     pyarrow==17.0.0 \
     pandas==2.2.2 \

@@ -4,6 +4,8 @@ ordering or a cached Settings singleton from another test module."""
 
 from __future__ import annotations
 
+import pytest
+
 from common.config import get_settings
 
 
@@ -93,3 +95,31 @@ class TestDerivedProperties:
 
         assert url.startswith("postgresql+psycopg2://tester:secret@db.internal")
         assert url.endswith("/wikipulse_test")
+
+
+class TestValidation:
+    def test_page_history_ttl_must_be_positive(self, monkeypatch):
+        monkeypatch.setenv("ANOMALY_HISTORY_TTL_SECONDS", "0")
+        with pytest.raises(ValueError, match="ANOMALY_HISTORY_TTL_SECONDS"):
+            get_settings(force_reload=True)
+
+    def test_page_history_cleanup_interval_must_be_positive(self, monkeypatch):
+        monkeypatch.setenv("ANOMALY_HISTORY_CLEANUP_INTERVAL_SECONDS", "-5")
+        with pytest.raises(ValueError, match="ANOMALY_HISTORY_CLEANUP_INTERVAL_SECONDS"):
+            get_settings(force_reload=True)
+
+    def test_retention_hours_must_be_positive(self, monkeypatch):
+        monkeypatch.setenv("POSTGRES_RETENTION_HOURS", "0")
+        with pytest.raises(ValueError, match="POSTGRES_RETENTION_HOURS"):
+            get_settings(force_reload=True)
+
+    def test_partition_horizon_must_be_at_least_one_day(self, monkeypatch):
+        monkeypatch.setenv("POSTGRES_PARTITION_HORIZON_DAYS", "0")
+        with pytest.raises(ValueError, match="POSTGRES_PARTITION_HORIZON_DAYS"):
+            get_settings(force_reload=True)
+
+
+class TestRetentionDefaults:
+    def test_postgres_retention_defaults_to_72_hours(self, monkeypatch):
+        monkeypatch.delenv("POSTGRES_RETENTION_HOURS", raising=False)
+        assert get_settings(force_reload=True).postgres.retention_hours == 72

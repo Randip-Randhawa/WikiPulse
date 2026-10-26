@@ -1,4 +1,4 @@
-.PHONY: help setup infra-up infra-down init-db ingest process dashboard synthetic-spike synthetic-editwar synthetic-normal test purge
+.PHONY: help setup infra-up infra-down init-db ingest process dashboard synthetic-spike synthetic-editwar synthetic-normal test purge maintain-partitions benchmark
 
 help:
 	@echo "WikiPulse local development commands"
@@ -14,6 +14,8 @@ help:
 	@echo "  make synthetic-editwar Publish a synthetic reciprocal-revert edit war"
 	@echo "  make test              Run the test suite"
 	@echo "  make purge             Purge old PostgreSQL rows per retention policy"
+	@echo "  make maintain-partitions Create upcoming partitions and apply retention once"
+	@echo "  make benchmark         Run component benchmarks (BENCHMARK_ARGS=\"--postgres\" to add stages)"
 
 setup:
 	pip install -r requirements.txt
@@ -34,7 +36,7 @@ process:
 	python -m processing.streaming_job
 
 dashboard:
-	streamlit run dashboard/app.py
+	python -m streamlit run dashboard/app.py
 
 synthetic-normal:
 	python -m scripts.generate_synthetic_events --scenario normal --duration 120
@@ -50,3 +52,9 @@ test:
 
 purge:
 	python -m scripts.purge_old_data
+
+maintain-partitions:
+	python -m scripts.maintain_partitions
+
+benchmark:
+	python -m benchmark.runner $(BENCHMARK_ARGS)

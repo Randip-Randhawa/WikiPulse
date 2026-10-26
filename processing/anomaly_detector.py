@@ -1,10 +1,9 @@
 """Activity-anomaly detection: median + Median Absolute Deviation (MAD).
 
-Lab 1 originally specified a plain z-score threshold. Lab 2 explicitly
-replaces that with a robust median/MAD approach (see project spec Section
-5 and Section 20) because a small number of extremely active Wikipedia
-pages ("Main Page", breaking-news articles, etc.) would otherwise distort
-a mean/stddev-based baseline for everyone else.
+A plain mean/stddev z-score is not used because a few extremely active
+windows (breaking-news edits, a vandalism wave) would inflate the baseline
+and hide later spikes. The median and MAD are barely moved by such
+outliers.
 
 Robust z-score (a.k.a. modified z-score), per page:
 
@@ -17,26 +16,25 @@ standard z-score under a normal distribution, which is the standard
 convention for MAD-based robust outlier scoring.
 
 Insufficient history fallback: a brand-new or rarely-edited page has no
-meaningful baseline to compare against. Per Lab 2, such pages instead use
-a simple, configurable count-based rule (`ANOMALY_FALLBACK_EDIT_COUNT_THRESHOLD`)
+meaningful baseline to compare against. Such pages instead use a simple,
+configurable count-based rule (`ANOMALY_FALLBACK_EDIT_COUNT_THRESHOLD`)
 rather than forcing a statistically unreliable median/MAD computation on
 too little data.
 
 This module is deliberately pure-Python/stateless-per-call so it can be
 unit tested in isolation from Spark and reused by both the streaming job
 and any batch backfill script. Per-page rolling history is maintained by
-`PageHistoryStore`, a simple bounded in-memory store updated once per
-micro-batch by the streaming job's driver (see processing/streaming_job.py
-for why this is an appropriate, deliberately simple design for a
-local/academic-scale project rather than a distributed streaming K/V store).
+`PageHistoryStore`, a bounded in-memory store updated by the streaming
+job's driver as windows are finalized.
 """
 
 from __future__ import annotations
 
 import statistics
-from collections import defaultdict, deque
+import time
+from collections import OrderedDict, deque
 from dataclasses import dataclass
-from typing import Deque, Dict, Optional, Tuple
+from typing import Callable, Deque, Optional, Tuple
 
 from common.config import AnomalyConfig
 
@@ -87,8 +85,10 @@ def compute_anomaly(
     baseline_median = statistics.median(history)
     baseline_mad = median_absolute_deviation(history, baseline_median)
 
-    # Guard against a zero MAD (e.g. a page with perfectly constant activity)
-    # which would otherwise produce a divide-by-zero / infinite score.
+    # Edit counts are whole numbers, so a MAD below one edit (the default
+    # floor) says nothing about spread. Without the floor, a sparsely edited
+    # page whose history is all 1s has MAD 0, and a window of 2 edits would
+    # score in the hundreds of thousands.
     effective_mad = baseline_mad if baseline_mad > config.mad_epsilon else config.mad_epsilon
 
     score = _MAD_SCALE_CONSTANT * (current_edit_count - baseline_median) / effective_mad
@@ -104,31 +104,87 @@ def compute_anomaly(
     )
 
 
+@dataclass
+class _PageHistory:
+    counts: Deque[float]
+    last_recorded_at: float
+
+
 class PageHistoryStore:
     """Bounded rolling history of per-window edit counts, keyed by
-    (wiki, page_title). Updated once per micro-batch on the Spark driver.
+    (wiki, page_title). Updated on the Spark driver as windows are finalized.
 
     This is an intentionally simple, single-process, in-memory structure.
     It is appropriate here because:
     - The project runs as a single local Spark driver (no multi-node
       distribution requiring shared state).
-    - History only needs to span `ANOMALY_HISTORY_LOOKBACK_WINDOWS` windows
-      (a bounded, small amount of memory per page).
+    - Each page keeps at most `ANOMALY_HISTORY_LOOKBACK_WINDOWS` counts.
     A production system would likely externalize this to a fast key-value
     store; that is explicitly out of scope for this academic project.
+
+    The number of pages is bounded by evicting any page that has not had a
+    window recorded for `ANOMALY_HISTORY_TTL_SECONDS`; otherwise every page
+    ever edited would stay in memory. Inactivity is measured on the
+    injected monotonic clock, not event time, so a replayed backlog or a
+    wall-clock jump cannot evict pages early. An evicted page that becomes
+    active again starts with an empty history and is judged by the
+    count-based fallback until it has enough windows again.
+
+    Only finalized windows are recorded here; windows still filling up
+    live in Spark's own state, which the watermark bounds.
     """
 
-    def __init__(self, config: AnomalyConfig):
+    def __init__(self, config: AnomalyConfig, clock: Callable[[], float] = time.monotonic):
         self._config = config
-        self._history: Dict[Tuple[str, str], Deque[float]] = defaultdict(
-            lambda: deque(maxlen=config.history_lookback_windows)
-        )
+        self._clock = clock
+        # Least recently recorded page first, so expired pages are always
+        # at the front and a sweep stops at the first page still active.
+        self._pages: OrderedDict[Tuple[str, str], _PageHistory] = OrderedDict()
+        self._last_sweep_at = clock()
+        self.evicted_pages_total = 0
+
+    @property
+    def active_pages(self) -> int:
+        return len(self._pages)
+
+    def observation_count(self) -> int:
+        """Total window counts held across all pages (walks every page)."""
+        return sum(len(page.counts) for page in self._pages.values())
 
     def get_history(self, wiki: str, page_title: str) -> list[float]:
-        return list(self._history[(wiki, page_title)])
+        page = self._pages.get((wiki, page_title))
+        return list(page.counts) if page else []
 
     def record(self, wiki: str, page_title: str, edit_count: int) -> None:
-        self._history[(wiki, page_title)].append(float(edit_count))
+        now = self._clock()
+        key = (wiki, page_title)
+        page = self._pages.get(key)
+        if page is None:
+            page = _PageHistory(deque(maxlen=self._config.history_lookback_windows), now)
+            self._pages[key] = page
+        else:
+            page.last_recorded_at = now
+            self._pages.move_to_end(key)
+        page.counts.append(float(edit_count))
+
+        if now - self._last_sweep_at >= self._config.history_cleanup_interval_seconds:
+            self.evict_inactive_pages()
+
+    def evict_inactive_pages(self) -> int:
+        """Drop pages with no recorded window for at least the TTL and
+        return how many were dropped."""
+        now = self._clock()
+        cutoff = now - self._config.history_ttl_seconds
+        evicted = 0
+        while self._pages:
+            oldest_page = next(iter(self._pages.values()))
+            if oldest_page.last_recorded_at > cutoff:
+                break
+            self._pages.popitem(last=False)
+            evicted += 1
+        self.evicted_pages_total += evicted
+        self._last_sweep_at = now
+        return evicted
 
     def evaluate_and_record(
         self, wiki: str, page_title: str, current_edit_count: int
