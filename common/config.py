@@ -224,6 +224,15 @@ class StreamConsumerConfig:
     watermark_delay_seconds: float = field(
         default_factory=lambda: _get_float("STREAM_WATERMARK_DELAY_SECONDS", 120.0)
     )
+    page_inactivity_ttl_seconds: float = field(
+        default_factory=lambda: _get_float("STREAM_PAGE_INACTIVITY_TTL_SECONDS", 600.0)
+    )
+    max_active_pages: int = field(
+        default_factory=lambda: _get_int("STREAM_MAX_ACTIVE_PAGES", 50000)
+    )
+    cleanup_interval_seconds: float = field(
+        default_factory=lambda: _get_float("STREAM_CLEANUP_INTERVAL_SECONDS", 30.0)
+    )
     host_node: str = field(
         default_factory=lambda: _get_str("STREAM_HOST_NODE", "stream-worker-01")
     )

@@ -20,7 +20,7 @@ import os
 import signal
 import sys
 import time
-from collections import Counter, defaultdict, deque
+from collections import Counter, OrderedDict, defaultdict, deque
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
@@ -81,11 +81,15 @@ class ConflictGraphTracker:
 
 
 class InMemorySlidingWindowEngine:
-    """In-memory sliding window engine.
+    """In-memory sliding window engine with TTL cache eviction and capacity bounding.
 
     Maintains a 300-second rolling deque of events per (wiki, page_title)
-    evaluated every 30 seconds (configurable). Drops late arrivals
-    beyond the watermark delay threshold.
+    evaluated every 30 seconds (configurable).
+    Features:
+    - Event-time watermark delay for dropping late arrivals.
+    - Window-time expiry for events older than 300s.
+    - Time-to-Live (TTL) cache eviction for inactive page deques.
+    - LRU capacity ceiling to bound maximum active pages and worker memory.
     """
 
     def __init__(
@@ -93,21 +97,36 @@ class InMemorySlidingWindowEngine:
         window_duration_seconds: float = 300.0,
         slide_interval_seconds: float = 30.0,
         watermark_delay_seconds: float = 120.0,
+        page_inactivity_ttl_seconds: float = 600.0,
+        max_active_pages: int = 50000,
+        cleanup_interval_seconds: float = 30.0,
     ) -> None:
         self.window_duration_seconds = float(window_duration_seconds)
         self.slide_interval_seconds = float(slide_interval_seconds)
         self.watermark_delay_seconds = float(watermark_delay_seconds)
+        self.page_inactivity_ttl_seconds = float(page_inactivity_ttl_seconds)
+        self.max_active_pages = int(max_active_pages)
+        self.cleanup_interval_seconds = float(cleanup_interval_seconds)
 
         # (wiki, page_title) -> deque of WikipediaEvent
         self._deques: dict[tuple[str, str], deque[WikipediaEvent]] = defaultdict(deque)
+        # (wiki, page_title) -> last event timestamp seen (LRU ordering)
+        self._last_touched: OrderedDict[tuple[str, str], float] = OrderedDict()
         self.max_event_time: float = 0.0
         self.watermark: float = 0.0
         self.late_events_dropped: int = 0
         self.total_events_added: int = 0
+        self._last_cleanup_time: float = 0.0
+        self.evicted_pages_total: int = 0
+        self.evicted_by_ttl: int = 0
+        self.evicted_by_capacity: int = 0
 
     @property
     def active_pages(self) -> int:
         return len(self._deques)
+
+    def total_buffered_events(self) -> int:
+        return sum(len(q) for q in self._deques.values())
 
     def add_event(self, event: WikipediaEvent) -> bool:
         """Add an event to its page's rolling deque.
@@ -125,8 +144,57 @@ class InMemorySlidingWindowEngine:
 
         key = (event.wiki, event.page_title)
         self._deques[key].append(event)
+        self._last_touched[key] = ts
+        self._last_touched.move_to_end(key)
         self.total_events_added += 1
+
+        # Enforce capacity limit (LRU eviction if over max_active_pages)
+        if len(self._deques) > self.max_active_pages:
+            self.enforce_capacity_limit()
+
+        # Check periodic TTL cleanup
+        if ts - self._last_cleanup_time >= self.cleanup_interval_seconds:
+            self.evict_inactive_pages(ts)
+            self._last_cleanup_time = ts
+
         return True
+
+    def enforce_capacity_limit(self) -> int:
+        """Evict least recently touched pages when exceeding max_active_pages."""
+        evicted = 0
+        while len(self._deques) > self.max_active_pages and self._last_touched:
+            oldest_key, _ = self._last_touched.popitem(last=False)
+            if oldest_key in self._deques:
+                del self._deques[oldest_key]
+                evicted += 1
+                self.evicted_pages_total += 1
+                self.evicted_by_capacity += 1
+        return evicted
+
+    def evict_inactive_pages(self, current_time: float) -> int:
+        """Evict pages that have had no events for longer than page_inactivity_ttl_seconds."""
+        cutoff = current_time - self.page_inactivity_ttl_seconds
+        evicted = 0
+        expired_keys = []
+
+        for key, last_ts in list(self._last_touched.items()):
+            if last_ts < cutoff or not self._deques.get(key):
+                expired_keys.append(key)
+            else:
+                break
+
+        for key in list(self._deques.keys()):
+            if not self._deques[key] and key not in expired_keys:
+                expired_keys.append(key)
+
+        for key in expired_keys:
+            self._deques.pop(key, None)
+            self._last_touched.pop(key, None)
+            evicted += 1
+            self.evicted_pages_total += 1
+            self.evicted_by_ttl += 1
+
+        return evicted
 
     def evict_expired(self, current_time: float) -> int:
         """Evict events older than (current_time - window_duration_seconds) from deques."""
@@ -143,8 +211,23 @@ class InMemorySlidingWindowEngine:
 
         for key in empty_keys:
             del self._deques[key]
+            self._last_touched.pop(key, None)
 
         return evicted
+
+    def get_memory_stats(self) -> dict[str, Any]:
+        """Return memory and deque occupancy statistics."""
+        import psutil
+        rss_mb = round(psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024), 2)
+        return {
+            "active_pages": self.active_pages,
+            "buffered_events": self.total_buffered_events(),
+            "evicted_pages_total": self.evicted_pages_total,
+            "evicted_by_ttl": self.evicted_by_ttl,
+            "evicted_by_capacity": self.evicted_by_capacity,
+            "late_events_dropped": self.late_events_dropped,
+            "process_rss_mb": rss_mb,
+        }
 
     def evaluate_windows(
         self,
@@ -155,6 +238,7 @@ class InMemorySlidingWindowEngine:
     ) -> WindowEvaluationResult:
         """Evaluate all active page deques over the window [evaluation_time - window_duration, evaluation_time)."""
         self.evict_expired(evaluation_time)
+        self.evict_inactive_pages(evaluation_time)
 
         window_start_ts = evaluation_time - self.window_duration_seconds
         window_start_dt = datetime.fromtimestamp(window_start_ts, tz=timezone.utc)
@@ -324,6 +408,9 @@ class StatefulStreamConsumer:
             window_duration_seconds=cfg.window_duration_seconds,
             slide_interval_seconds=cfg.slide_interval_seconds,
             watermark_delay_seconds=cfg.watermark_delay_seconds,
+            page_inactivity_ttl_seconds=cfg.page_inactivity_ttl_seconds,
+            max_active_pages=cfg.max_active_pages,
+            cleanup_interval_seconds=cfg.cleanup_interval_seconds,
         )
         self.history_store = PageHistoryStore(settings.anomaly)
         self.host_node = cfg.host_node

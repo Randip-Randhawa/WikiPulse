@@ -217,12 +217,12 @@ def wikis_seen(fetch: Fetch, minutes: int) -> list[str]:
 
 def recent_anomalies(fetch: Fetch, filters: Filters, limit: int = TABLE_ROW_LIMIT) -> pd.DataFrame:
     columns = ["wiki", "page_title", "window_start", "window_end", "edit_count", "unique_editors",
-               "baseline_median", "baseline_mad", "anomaly_score", "anomaly_type", "threshold_used"]
+               "baseline_median", "baseline_mad", "anomaly_score", "anomaly_type", "threshold_used", "provenance_id"]
     where, params = where_clause(filters, "window_start", has_bot_column=False)
     rows = fetch(
         f"""
         SELECT {", ".join(columns)}
-        FROM anomaly_events
+        FROM fact_anomalies
         WHERE {where}
         ORDER BY window_start DESC
         LIMIT %s
@@ -363,3 +363,115 @@ def parquet_daily_event_counts(base_path: str, first_day: date, last_day: date) 
         counts[key] = counts.get(key, 0) + fragment.count_rows()
     rows = [{"date": day, "wiki": wiki, "events": events} for (day, wiki), events in sorted(counts.items())]
     return pd.DataFrame(rows, columns=columns)
+
+
+# --- Analytical views & Data Provenance ---------------------------------------
+
+def latency_waterfall_summary(fetch: Fetch, filters: Filters) -> pd.DataFrame:
+    """Waterfall latency percentiles (ingestion, compute, end-to-end) from fact_edit_events."""
+    where, params = where_clause(filters, "event_timestamp", has_bot_column=False)
+    rows = fetch(
+        f"""
+        SELECT
+            ROUND(PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY ingestion_latency_ms)::numeric, 1) AS ingest_p50,
+            ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ingestion_latency_ms)::numeric, 1) AS ingest_p95,
+            ROUND(PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY ingestion_latency_ms)::numeric, 1) AS ingest_p99,
+            ROUND(AVG(ingestion_latency_ms)::numeric, 1) AS ingest_avg,
+            ROUND(PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY compute_latency_ms)::numeric, 1) AS compute_p50,
+            ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY compute_latency_ms)::numeric, 1) AS compute_p95,
+            ROUND(PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY compute_latency_ms)::numeric, 1) AS compute_p99,
+            ROUND(AVG(compute_latency_ms)::numeric, 1) AS compute_avg,
+            ROUND(PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY end_to_end_latency_ms)::numeric, 1) AS e2e_p50,
+            ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY end_to_end_latency_ms)::numeric, 1) AS e2e_p95,
+            ROUND(PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY end_to_end_latency_ms)::numeric, 1) AS e2e_p99,
+            ROUND(AVG(end_to_end_latency_ms)::numeric, 1) AS e2e_avg,
+            count(*) AS sampled_events
+        FROM fact_edit_events
+        WHERE {where} AND ingestion_latency_ms IS NOT NULL
+        """,
+        params,
+    )
+    cols = [
+        "ingest_p50", "ingest_p95", "ingest_p99", "ingest_avg",
+        "compute_p50", "compute_p95", "compute_p99", "compute_avg",
+        "e2e_p50", "e2e_p95", "e2e_p99", "e2e_avg",
+        "sampled_events",
+    ]
+    return _frame(rows, cols)
+
+
+def user_type_distribution(fetch: Fetch, filters: Filters) -> pd.DataFrame:
+    """Categorical user distribution (BOT, ANONYMOUS, REGISTERED) from fact_edit_events."""
+    where, params = where_clause(filters, "event_timestamp", has_bot_column=False)
+    rows = fetch(
+        f"""
+        SELECT COALESCE(user_type, 'REGISTERED') AS user_type,
+               count(*) AS edit_count,
+               count(DISTINCT user_name) AS unique_users,
+               SUM(CASE WHEN is_revert THEN 1 ELSE 0 END) AS revert_count,
+               SUM(CASE WHEN is_minor THEN 1 ELSE 0 END) AS minor_count
+        FROM fact_edit_events
+        WHERE {where}
+        GROUP BY user_type
+        ORDER BY edit_count DESC
+        """,
+        params,
+    )
+    return _frame(rows, ["user_type", "edit_count", "unique_users", "revert_count", "minor_count"])
+
+
+def provenance_audit_lookup(fetch: Fetch, provenance_id: str) -> Optional[dict[str, Any]]:
+    """Look up an event or anomaly by its exact provenance_id key."""
+    if not provenance_id or not provenance_id.strip():
+        return None
+    pid = provenance_id.strip()
+    rows = fetch(
+        """
+        SELECT event_id, provenance_id, page_title, user_name, user_type,
+               event_timestamp, ingest_timestamp, processing_timestamp,
+               ingestion_latency_ms, compute_latency_ms, end_to_end_latency_ms,
+               byte_delta, is_minor, is_revert, comment_length, wiki
+        FROM fact_edit_events
+        WHERE provenance_id = %s
+        LIMIT 1
+        """,
+        (pid,),
+    )
+    if rows:
+        return rows[0]
+    anom_rows = fetch(
+        """
+        SELECT id::text AS event_id, provenance_id, page_title, NULL AS user_name,
+               'ANOMALY' AS user_type, window_start AS event_timestamp,
+               NULL AS ingest_timestamp, created_at AS processing_timestamp,
+               NULL AS ingestion_latency_ms, NULL AS compute_latency_ms,
+               NULL AS end_to_end_latency_ms, 0 AS byte_delta,
+               FALSE AS is_minor, FALSE AS is_revert, 0 AS comment_length, wiki
+        FROM fact_anomalies
+        WHERE provenance_id = %s
+        LIMIT 1
+        """,
+        (pid,),
+    )
+    return anom_rows[0] if anom_rows else None
+
+
+def conflict_graph_pairs(fetch: Fetch, filters: Filters, limit: int = 20) -> pd.DataFrame:
+    """Reciprocal edit war editor pairs and conflict scores."""
+    where, params = where_clause(filters, "window_end", has_bot_column=False)
+    rows = fetch(
+        f"""
+        SELECT window_end, wiki, page_title, editor_a, editor_b,
+               mutual_revert_count, conflict_score, flag, provenance_id
+        FROM edit_war_signals
+        WHERE {where} AND (mutual_revert_count > 0 OR flag = TRUE)
+        ORDER BY conflict_score DESC, window_end DESC
+        LIMIT %s
+        """,
+        [*params, limit],
+    )
+    return _frame(
+        rows,
+        ["window_end", "wiki", "page_title", "editor_a", "editor_b",
+         "mutual_revert_count", "conflict_score", "flag", "provenance_id"],
+    )

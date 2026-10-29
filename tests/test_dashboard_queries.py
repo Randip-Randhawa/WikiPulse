@@ -60,12 +60,23 @@ class TestEmptyResults:
     @pytest.mark.parametrize("name", [
         "edits_per_minute", "most_active_pages", "latest_page_velocity", "recent_anomalies",
         "anomaly_frequency", "recent_edit_war_signals", "edit_war_trend", "hourly_edits",
+        "latency_waterfall_summary", "user_type_distribution", "conflict_graph_pairs",
     ])
     def test_filtered_queries_return_their_columns_when_empty(self, name):
         frame = getattr(queries, name)(FakeFetch(), Filters(minutes=60))
 
         assert frame.empty
         assert len(frame.columns) > 0
+
+    def test_provenance_audit_lookup_with_empty_or_matched(self):
+        fetch = FakeFetch()
+        assert queries.provenance_audit_lookup(fetch, "") is None
+        assert queries.provenance_audit_lookup(fetch, "   ") is None
+
+        fetch_hit = FakeFetch([{"event_id": "1", "provenance_id": "node-1:100:part-0:off-1"}])
+        res = queries.provenance_audit_lookup(fetch_hit, "node-1:100:part-0:off-1")
+        assert res is not None
+        assert res["provenance_id"] == "node-1:100:part-0:off-1"
 
     def test_page_comparison_without_pages_skips_the_database(self):
         fetch = FakeFetch()

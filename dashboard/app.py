@@ -188,6 +188,31 @@ def render_health(filters: Filters) -> None:
                           labels={"recorded_at": "Time (UTC)", "value": "Milliseconds", "variable": "Measure"})
             st.plotly_chart(fig, use_container_width=True)
 
+    waterfall = load("latency_waterfall_summary", filters)
+    if waterfall is not None and not waterfall.empty and waterfall.iloc[0]["sampled_events"] > 0:
+        st.subheader("Deterministic Latency Waterfall (T_event → T_ingest → T_proc)")
+        st.caption("Synchronized latency audit computed directly from fact_edit_events.")
+        w_row = waterfall.iloc[0]
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Ingestion Latency p95", f"{w_row['ingest_p95']} ms", help="T_ingest - T_event")
+        m2.metric("Compute Latency p95", f"{w_row['compute_p95']} ms", help="T_proc - T_ingest")
+        m3.metric("End-to-End Latency p95", f"{w_row['e2e_p95']} ms", help="T_proc - T_event")
+        m4.metric("Audited Events", f"{int(w_row['sampled_events']):,}")
+
+        waterfall_df = pd.DataFrame([
+            {"Stage": "1. Ingestion (SSE → Kafka)", "Latency (ms)": w_row["ingest_p50"], "Metric": "p50"},
+            {"Stage": "1. Ingestion (SSE → Kafka)", "Latency (ms)": w_row["ingest_p95"], "Metric": "p95"},
+            {"Stage": "2. Stream Compute (Sliding Window/MAD)", "Latency (ms)": w_row["compute_p50"], "Metric": "p50"},
+            {"Stage": "2. Stream Compute (Sliding Window/MAD)", "Latency (ms)": w_row["compute_p95"], "Metric": "p95"},
+            {"Stage": "3. Total End-to-End", "Latency (ms)": w_row["e2e_p50"], "Metric": "p50"},
+            {"Stage": "3. Total End-to-End", "Latency (ms)": w_row["e2e_p95"], "Metric": "p95"},
+        ])
+        fig_w = px.bar(
+            waterfall_df, x="Stage", y="Latency (ms)", color="Metric", barmode="group",
+            title="Waterfall Latency Distribution (Analytical View: fact_edit_events)"
+        )
+        st.plotly_chart(fig_w, use_container_width=True)
+
 
 # --- Live activity -----------------------------------------------------------
 
@@ -227,6 +252,22 @@ def render_live_activity(filters: Filters) -> None:
             st.info("No finalized windows in this range yet.")
         elif velocity is not None:
             st.dataframe(velocity, use_container_width=True, hide_index=True)
+
+    user_dist = load("user_type_distribution", filters)
+    if user_dist is not None and not user_dist.empty:
+        st.subheader("User Classification Demographics (BOT / ANONYMOUS / REGISTERED)")
+        st.caption("Distribution based on Wikimedia bot flags and IPv4/IPv6 regex isolation.")
+        col_pie, col_table = st.columns([1, 2])
+        with col_pie:
+            fig_u = px.pie(
+                user_dist, names="user_type", values="edit_count",
+                title="Editor Demographics",
+                color="user_type",
+                color_discrete_map={"REGISTERED": "#636EFA", "ANONYMOUS": "#EF553B", "BOT": "#00CC96"},
+            )
+            st.plotly_chart(fig_u, use_container_width=True)
+        with col_table:
+            st.dataframe(user_dist, use_container_width=True, hide_index=True)
 
 
 # --- Anomalies -----------------------------------------------------------------
@@ -286,6 +327,12 @@ def render_edit_wars(filters: Filters) -> None:
         st.plotly_chart(fig, use_container_width=True)
     st.dataframe(signals, use_container_width=True, hide_index=True)
 
+    pairs = load("conflict_graph_pairs", filters)
+    if pairs is not None and not pairs.empty:
+        st.subheader("Top Reciprocal Conflict Pairs (Editor A ↔ Editor B)")
+        st.caption("Directed mutual revert conflict graph tracking reciprocal editor interactions.")
+        st.dataframe(pairs, use_container_width=True, hide_index=True)
+
     pages = signals[["wiki", "page_title"]].drop_duplicates().to_records(index=False)
     choice = st.selectbox("Show the reverts behind a signal", [f"{wiki} · {title}" for wiki, title in pages])
     if choice:
@@ -342,6 +389,37 @@ def render_history(filters: Filters) -> None:
     st.plotly_chart(fig, use_container_width=True)
 
 
+# --- Lineage & Provenance Inspector ---------------------------------------------
+
+def render_provenance_inspector() -> None:
+    st.header("Data Lineage & Provenance Inspector")
+    st.caption(
+        "Trace any downstream analytical record, anomaly alert, or edit war back to its exact "
+        "Kafka broker partition, consumer offset, and ingestion host node."
+    )
+    with st.form("provenance_lookup_form"):
+        pid_input = st.text_input(
+            "Enter Provenance ID (format: HostNode:IngestEpoch:Partition:Offset)",
+            placeholder="stream-worker-01:1767225600:part-2:off-49120",
+        ).strip()
+        submitted = st.form_submit_button("Trace Provenance Lineage")
+
+    if submitted and pid_input:
+        record = load("provenance_audit_lookup", pid_input)
+        if record is None:
+            st.warning(f"No edit event or anomaly found matching Provenance ID: `{pid_input}`")
+        else:
+            st.success(f"Provenance match verified for `{pid_input}`")
+            parts = pid_input.split(":")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Ingest Node", parts[0] if len(parts) > 0 else "N/A")
+            c2.metric("Ingest Epoch", parts[1] if len(parts) > 1 else "N/A")
+            c3.metric("Kafka Partition", parts[2] if len(parts) > 2 else "N/A")
+            c4.metric("Kafka Offset", parts[3] if len(parts) > 3 else "N/A")
+
+            st.json(record)
+
+
 # --- Page ------------------------------------------------------------------------
 
 def sidebar_filters() -> tuple[Filters, bool]:
@@ -380,6 +458,8 @@ def render_panels(filters: Filters) -> None:
     render_edit_wars(filters)
     st.divider()
     render_history(filters)
+    st.divider()
+    render_provenance_inspector()
     st.caption(f"Times are UTC. Queries are cached for {settings.dashboard.refresh_seconds}s.")
 
 

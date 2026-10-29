@@ -99,6 +99,44 @@ class TestInMemorySlidingWindowEngine:
         assert len(engine._deques[("enwiki", "PageA")]) == 2
         assert engine._deques[("enwiki", "PageA")][0].timestamp == 1150.0
 
+    def test_window_engine_inactivity_ttl_eviction(self):
+        engine = InMemorySlidingWindowEngine(
+            window_duration_seconds=300.0,
+            slide_interval_seconds=30.0,
+            page_inactivity_ttl_seconds=600.0,
+        )
+        engine.add_event(_make_event("OldPage", 1000.0))
+        assert engine.active_pages == 1
+
+        # Advance to 1650 (650s elapsed > 600s TTL)
+        evicted = engine.evict_inactive_pages(1650.0)
+        assert evicted == 1
+        assert engine.active_pages == 0
+        assert engine.evicted_by_ttl == 1
+
+    def test_window_engine_lru_capacity_ceiling(self):
+        engine = InMemorySlidingWindowEngine(
+            max_active_pages=3,
+        )
+        for i in range(1, 5):
+            engine.add_event(_make_event(f"Page{i}", 1000.0 + i))
+
+        # Max active pages is 3, so Page1 was evicted
+        assert engine.active_pages == 3
+        assert engine.evicted_by_capacity == 1
+        assert ("enwiki", "Page1") not in engine._deques
+        assert ("enwiki", "Page4") in engine._deques
+
+    def test_window_engine_memory_stats(self):
+        engine = InMemorySlidingWindowEngine()
+        engine.add_event(_make_event("PageA", 1000.0))
+        stats = engine.get_memory_stats()
+
+        assert stats["active_pages"] == 1
+        assert stats["buffered_events"] == 1
+        assert "process_rss_mb" in stats
+        assert stats["process_rss_mb"] > 0
+
     def test_window_engine_evaluates_activity_and_mad_baseline(self):
         engine = InMemorySlidingWindowEngine(
             window_duration_seconds=300.0,
