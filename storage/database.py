@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import logging
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional, Sequence
@@ -30,10 +30,12 @@ from psycopg2 import sql
 from common.config import PostgresConfig
 from storage.partitions import (
     PARTITIONED_TABLES,
+    PartitionHealthReport,
     day_bounds,
     days_to_cover,
     default_partition_name,
     expired_days,
+    is_partition_archived_in_lake,
     partition_day,
     partition_name,
     retention_cutoff,
@@ -65,6 +67,7 @@ class RetentionResult:
     cutoff: datetime
     dropped_partitions: list[str]
     deleted_rows: dict[str, int]
+    drained_partitions: list[str] = field(default_factory=list)
 
 
 def _legacy_table_name(table: str) -> str:
@@ -466,17 +469,27 @@ class Database:
     # ------------------------------------------------------------------
     # Retention / purging
     # ------------------------------------------------------------------
-    def purge_old_data(self, now: Optional[datetime] = None) -> RetentionResult:
+    def purge_old_data(
+        self,
+        now: Optional[datetime] = None,
+        parquet_base_path: Optional[str | Path] = None,
+        drain_before_drop: bool = True,
+    ) -> RetentionResult:
         """Remove PostgreSQL rows older than POSTGRES_RETENTION_HOURS.
 
-        Daily partitions lying entirely before the cutoff are dropped. Rows
-        older than the cutoff that remain -- in the partition holding the
+        Daily partitions lying entirely before the cutoff are dropped. If
+        `drain_before_drop=True` and `parquet_base_path` is specified, any partition
+        not yet archived in the Parquet Lake is drained before dropping to prevent
+        unintended data loss.
+
+        Rows older than the cutoff that remain -- in the partition holding the
         cutoff, the default partitions and the unpartitioned tables -- are
         then deleted, so the cutoff is exact. Parquet history is untouched.
         """
         now = now or datetime.now(timezone.utc)
         cutoff = retention_cutoff(now, self._config.retention_hours)
         dropped_partitions = []
+        drained_partitions = []
         deleted_rows = {}
         with self._connect() as conn:
             with conn.cursor() as cur:
@@ -484,10 +497,30 @@ class Database:
                 for table in PARTITIONED_TABLES:
                     partitions = self._existing_partition_days(cur, table)
                     for day in expired_days(partitions, cutoff):
-                        cur.execute(sql.SQL("DROP TABLE {}").format(sql.Identifier(partitions[day])))
-                        dropped_partitions.append(partitions[day])
+                        part_name = partitions[day]
+                        if drain_before_drop and parquet_base_path is not None:
+                            if not is_partition_archived_in_lake(parquet_base_path, table, day):
+                                cur.execute(sql.SQL("SELECT * FROM {}").format(sql.Identifier(part_name)))
+                                col_names = [desc[0] for desc in cur.description]
+                                rows = [dict(zip(col_names, r)) for r in cur.fetchall()]
+                                if rows:
+                                    from common.config import ParquetConfig
+                                    from storage.parquet_writer import ParquetWriter
+
+                                    time_col = PARTITIONED_TABLES[table]
+                                    writer = ParquetWriter(ParquetConfig(base_path=str(parquet_base_path)))
+                                    writer.write_lake_records(rows, time_field=time_col, wiki_field="wiki")
+                                    logger.info(
+                                        "Safety Drain: archived %d rows from %s to Parquet Lake before dropping",
+                                        len(rows),
+                                        part_name,
+                                    )
+                                drained_partitions.append(part_name)
+
+                        cur.execute(sql.SQL("DROP TABLE {}").format(sql.Identifier(part_name)))
+                        dropped_partitions.append(part_name)
                         logger.info("Dropped partition %s (older than %dh cutoff %s)",
-                                    partitions[day], self._config.retention_hours, cutoff.isoformat())
+                                    part_name, self._config.retention_hours, cutoff.isoformat())
                 for table, column in RETENTION_COLUMNS.items():
                     cur.execute(
                         sql.SQL("DELETE FROM {} WHERE {} < %s").format(
@@ -497,7 +530,53 @@ class Database:
                     deleted_rows[table] = cur.rowcount
         logger.info("Retention purge complete (cutoff=%s): dropped %d partitions, deleted rows %s",
                     cutoff.isoformat(), len(dropped_partitions), deleted_rows)
-        return RetentionResult(cutoff=cutoff, dropped_partitions=dropped_partitions, deleted_rows=deleted_rows)
+        return RetentionResult(
+            cutoff=cutoff,
+            dropped_partitions=dropped_partitions,
+            deleted_rows=deleted_rows,
+            drained_partitions=drained_partitions,
+        )
+
+    def check_partition_health(self, now: Optional[datetime] = None) -> PartitionHealthReport:
+        """Inspect PostgreSQL partition health, check for overflow into default
+        partitions, and verify coverage for current and upcoming horizon days."""
+        now = now or datetime.now(timezone.utc)
+        default_counts: dict[str, int] = {}
+        active_partitions: dict[str, list[str]] = {}
+        missing_partitions: dict[str, list[str]] = {}
+
+        needed_days = days_to_cover(now, self._config.retention_hours, horizon_days=3)
+
+        with self._connect() as conn, conn.cursor() as cur:
+            for table in PARTITIONED_TABLES:
+                default_tbl = default_partition_name(table)
+                cur.execute(sql.SQL("SELECT count(*) FROM {}").format(sql.Identifier(default_tbl)))
+                cnt = cur.fetchone()[0]
+                default_counts[default_tbl] = cnt
+
+                existing_map = self._existing_partition_days(cur, table)
+                active_partitions[table] = [partition_name(table, d) for d in sorted(existing_map.keys())]
+                missing = [partition_name(table, d) for d in needed_days if d not in existing_map]
+                missing_partitions[table] = missing
+
+        total_default = sum(default_counts.values())
+        total_missing = sum(len(m) for m in missing_partitions.values())
+
+        if total_default > 0 or total_missing > 0:
+            status = "CRITICAL" if total_default > 0 else "WARNING"
+            healthy = False
+        else:
+            status = "OK"
+            healthy = True
+
+        return PartitionHealthReport(
+            healthy=healthy,
+            status=status,
+            default_partition_rows=default_counts,
+            missing_partitions=missing_partitions,
+            active_partitions=active_partitions,
+            total_default_rows=total_default,
+        )
 
     # ------------------------------------------------------------------
     # Read helpers used by the dashboard

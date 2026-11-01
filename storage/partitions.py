@@ -16,8 +16,10 @@ This module only does the date arithmetic; storage.database runs the SQL.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Iterable, Optional
+from pathlib import Path
+from typing import Any, Iterable, Optional
 
 # Partitioned table -> the timestamp column it is partitioned on.
 PARTITIONED_TABLES = {
@@ -73,3 +75,39 @@ def expired_days(days: Iterable[date], cutoff: datetime) -> list[date]:
     The partition holding the cutoff itself is kept; its expired rows are
     deleted individually so the retention period is exact."""
     return sorted(day for day in days if day_bounds(day)[1] <= cutoff)
+
+
+@dataclass(frozen=True)
+class PartitionHealthReport:
+    healthy: bool
+    status: str  # "OK" | "WARNING" | "CRITICAL"
+    default_partition_rows: dict[str, int]
+    missing_partitions: dict[str, list[str]]
+    active_partitions: dict[str, list[str]]
+    total_default_rows: int
+
+
+def is_partition_archived_in_lake(base_path: str | Path, table: str, day: date) -> bool:
+    """Verify whether Parquet files covering `day` exist in the historical lake.
+
+    Checks:
+    1. Hierarchical Lake layout: base_path / wiki=* / year=YYYY / month=MM / day=DD /
+    2. Dataset layout: base_path / dataset / wiki=* / date=YYYY-MM-DD /
+    """
+    base = Path(base_path)
+    if not base.exists():
+        return False
+
+    year_str = f"year={day.year}"
+    month_str = f"month={day.month:02d}"
+    day_str = f"day={day.day:02d}"
+    hierarchical_files = list(base.glob(f"**/{year_str}/{month_str}/{day_str}/**/*.parquet"))
+    if hierarchical_files:
+        return True
+
+    date_str = f"date={day:%Y-%m-%d}"
+    flat_files = list(base.glob(f"**/{date_str}/**/*.parquet"))
+    if flat_files:
+        return True
+
+    return False

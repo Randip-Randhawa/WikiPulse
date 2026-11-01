@@ -157,6 +157,25 @@ def render_detection_health(row: Optional[dict[str, Any]]) -> None:
     )
 
 
+def render_maintenance_health(row: Optional[dict[str, Any]], now: pd.Timestamp) -> None:
+    st.subheader("Partition Maintenance")
+    show_status(row, now)
+    if row is None:
+        return
+    details = row["details"] or {}
+    status = details.get("status", "OK")
+    healthy = details.get("healthy", True)
+    default_rows = details.get("default_partition_rows") or {}
+    total_default = sum(default_rows.values())
+
+    st.metric("Partition Health", status, delta="0 default overflow" if healthy else f"{total_default} overflow rows")
+    st.metric("Active Partitions", format_value(row["events_parsed"], ""))
+    st.caption(
+        f"Retention drops {format_value(row['events_published'])} · "
+        f"default overflow {total_default} rows"
+    )
+
+
 def render_health(filters: Filters) -> None:
     st.header("System Health")
     latest = load("latest_component_metrics")
@@ -166,13 +185,15 @@ def render_health(filters: Filters) -> None:
     rows = {row["component"]: row for row in latest.to_dict("records")}
     st.caption("PostgreSQL: reachable from the dashboard.")
 
-    ingestion_col, processing_col, detection_col = st.columns(3)
+    ingestion_col, processing_col, detection_col, maintenance_col = st.columns(4)
     with ingestion_col:
         render_ingestion_health(rows.get("ingestion"), now)
     with processing_col:
         render_processing_health(rows.get("spark"), now)
     with detection_col:
         render_detection_health(rows.get("spark"))
+    with maintenance_col:
+        render_maintenance_health(rows.get("maintenance"), now)
 
     history = load("metrics_history", filters.minutes)
     if history is not None and not history.empty:

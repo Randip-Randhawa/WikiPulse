@@ -5,9 +5,13 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
 
+from pathlib import Path
+
 from storage.partitions import (
+    PartitionHealthReport,
     days_to_cover,
     expired_days,
+    is_partition_archived_in_lake,
     partition_day,
     partition_name,
     retention_cutoff,
@@ -66,3 +70,56 @@ class TestExpiredDays:
         cutoff = datetime(2026, 10, 23, 10, 0, tzinfo=UTC)
 
         assert expired_days([date(2026, 10, 24), date(2026, 10, 25)], cutoff) == []
+
+
+class TestPartitionLakeArchive:
+    def test_missing_lake_directory_returns_false(self, tmp_path):
+        assert is_partition_archived_in_lake(tmp_path / "nonexistent", "edit_events", date(2026, 10, 26)) is False
+
+    def test_empty_lake_directory_returns_false(self, tmp_path):
+        lake_dir = tmp_path / "lake"
+        lake_dir.mkdir()
+        assert is_partition_archived_in_lake(lake_dir, "edit_events", date(2026, 10, 26)) is False
+
+    def test_hierarchical_lake_layout_detected(self, tmp_path):
+        lake_dir = tmp_path / "lake"
+        part_dir = lake_dir / "wiki=enwiki" / "year=2026" / "month=10" / "day=26" / "hour=14"
+        part_dir.mkdir(parents=True)
+        (part_dir / "data.parquet").write_bytes(b"PAR1")
+
+        assert is_partition_archived_in_lake(lake_dir, "edit_events", date(2026, 10, 26)) is True
+        assert is_partition_archived_in_lake(lake_dir, "edit_events", date(2026, 10, 27)) is False
+
+    def test_flat_date_dataset_layout_detected(self, tmp_path):
+        lake_dir = tmp_path / "lake"
+        part_dir = lake_dir / "raw_events" / "wiki=enwiki" / "date=2026-10-26"
+        part_dir.mkdir(parents=True)
+        (part_dir / "data.parquet").write_bytes(b"PAR1")
+
+        assert is_partition_archived_in_lake(lake_dir, "edit_events", date(2026, 10, 26)) is True
+        assert is_partition_archived_in_lake(lake_dir, "edit_events", date(2026, 10, 25)) is False
+
+
+class TestPartitionHealthReport:
+    def test_health_report_status_mapping(self):
+        healthy_rep = PartitionHealthReport(
+            healthy=True,
+            status="OK",
+            default_partition_rows={"edit_events_default": 0},
+            missing_partitions={"edit_events": []},
+            active_partitions={"edit_events": ["edit_events_p20261026"]},
+            total_default_rows=0,
+        )
+        assert healthy_rep.healthy is True
+        assert healthy_rep.status == "OK"
+
+        crit_rep = PartitionHealthReport(
+            healthy=False,
+            status="CRITICAL",
+            default_partition_rows={"edit_events_default": 5},
+            missing_partitions={"edit_events": []},
+            active_partitions={"edit_events": ["edit_events_p20261026"]},
+            total_default_rows=5,
+        )
+        assert crit_rep.healthy is False
+        assert crit_rep.status == "CRITICAL"
