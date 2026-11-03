@@ -125,6 +125,186 @@ class TestCompare:
     def test_no_baseline_is_reported_as_not_compared(self):
         assert report.compare(self.results(1.0), None)["comparable"] is False
 
+    def test_consumer_scaling_metrics_compared(self):
+        baseline = {
+            "run_id": "20261026T000000Z",
+            "config": {"events": 100},
+            "environment": {"python": "3.12"},
+            "scenarios": {
+                "normal": {
+                    "consumer_scaling": {
+                        "events_per_sec": 1000.0,
+                        "evaluation_batch_ms": {"p95": 10.0},
+                        "latency_waterfall": {"end_to_end_ms": {"p95": 40.0}},
+                    }
+                }
+            },
+        }
+        current = {
+            "run_id": "20261026T010000Z",
+            "config": {"events": 100},
+            "environment": {"python": "3.12"},
+            "scenarios": {
+                "normal": {
+                    "consumer_scaling": {
+                        "events_per_sec": 1250.0,
+                        "evaluation_batch_ms": {"p95": 8.0},
+                        "latency_waterfall": {"end_to_end_ms": {"p95": 35.0}},
+                    }
+                }
+            },
+        }
+        comparison = report.compare(current, baseline)
+        assert comparison["comparable"] is True
+        metrics = {c["metric"]: c for c in comparison["changes"]}
+        assert "consumer_scaling.events_per_sec" in metrics
+        assert metrics["consumer_scaling.events_per_sec"]["change_pct"] == 25.0
+        assert metrics["consumer_scaling.events_per_sec"]["better"] is True
+        assert "consumer_scaling.evaluation_batch_ms.p95" in metrics
+        assert metrics["consumer_scaling.evaluation_batch_ms.p95"]["better"] is True
+
+
+class TestConsumerScalingBenchmark:
+    def test_consumer_scaling_bounds_memory_and_measures_waterfall(self):
+        settings = runner.get_settings()
+        events = [
+            make_event(f"Page_{i % 100}", ts=1_000_000.0 + (i * 2.0))
+            for i in range(300)
+        ]
+        result = runner.run_consumer_scaling_stage(
+            events,
+            settings,
+            max_active_pages=20,
+            slide_seconds=30.0,
+        )
+
+        assert result["events_processed"] == 300
+        assert result["active_pages"] <= 20
+        assert result["memory_bounded"] is True
+        assert result["evicted_by_capacity"] > 0
+        assert result["events_per_sec"] > 0
+        assert result["latency_waterfall"]["ingestion_ms"] is not None
+        assert result["latency_waterfall"]["compute_ms"] is not None
+        assert result["latency_waterfall"]["end_to_end_ms"] is not None
+        assert result["sla"]["memory_bounded_sla_met"] is True
+        assert result["sla"]["throughput_sla_met"] is True
+        assert result["sla"]["e2e_latency_sla_met"] is True
+
+    def test_consumer_scaling_inactivity_ttl_eviction(self):
+        from dataclasses import replace
+        base_settings = runner.get_settings()
+        settings = replace(
+            base_settings,
+            stream_consumer=replace(
+                base_settings.stream_consumer,
+                page_inactivity_ttl_seconds=30.0,
+            ),
+        )
+        # Page_Old is touched at t=1,000,000; Page_New is touched at t=1,000,045 (> 30s TTL, < 300s window)
+        events = [
+            make_event("Page_Old", ts=1_000_000.0),
+            make_event("Page_New", ts=1_000_045.0),
+        ]
+        result = runner.run_consumer_scaling_stage(
+            events,
+            settings,
+            max_active_pages=1000,
+            slide_seconds=30.0,
+        )
+
+        assert result["evicted_by_ttl"] >= 1
+        assert result["evicted_pages_total"] >= 1
+
+    def test_consumer_scaling_empty_events(self):
+        settings = runner.get_settings()
+        result = runner.run_consumer_scaling_stage([], settings)
+        assert result["events_processed"] == 0
+        assert result["active_pages"] == 0
+        assert result["memory_bounded"] is True
+        assert result["events_per_sec"] is None or result["events_per_sec"] == 0.0
+
+    def test_report_renders_consumer_scaling_and_latency_waterfall(self):
+        results = {
+            "run_id": "20261112T120000Z",
+            "kind": "test",
+            "environment": {
+                "python": "3.12",
+                "platform": "windows",
+                "cpu_count": 8,
+                "total_memory_mb": 16000,
+                "git_commit": "abc1234",
+                "git_uncommitted_changes": False,
+            },
+            "config": {"events": 100},
+            "page_history_memory": {"pages": 10, "lookback_windows": 12, "bytes_per_page": 256},
+            "scenarios": {
+                "normal": {
+                    "input_events": 100,
+                    "simulated_seconds": 60.0,
+                    "ingestion": {
+                        "events_per_sec": 5000.0,
+                        "accepted": 100,
+                        "filtered": 0,
+                        "rejected": 0,
+                        "dead_letter_rate": 0.0,
+                        "per_event_ms": {"p50": 0.1, "p95": 0.2, "p99": 0.3, "max": 0.5},
+                    },
+                    "detection": {
+                        "windows_per_sec": 200.0,
+                        "windows_evaluated": 20,
+                        "slide_seconds": 30.0,
+                        "micro_batches": 2,
+                        "duplicate_windows": 0,
+                        "evaluation_batch_ms": {"p50": 1.0, "p95": 2.0, "p99": 3.0, "max": 4.0},
+                        "page_history": {
+                            "peak_active_pages": 10,
+                            "evicted_pages_total": 0,
+                            "final_active_pages": 10,
+                        },
+                        "process_rss_mb_before": 50.0,
+                        "process_rss_mb_after": 52.0,
+                        "anomalies": {},
+                        "edit_war_signals": 0,
+                        "edit_wars_flagged": 0,
+                    },
+                    "consumer_scaling": {
+                        "events_per_sec": 8500.0,
+                        "active_pages": 15,
+                        "peak_active_pages": 20,
+                        "buffered_events": 45,
+                        "evicted_pages_total": 5,
+                        "evicted_by_ttl": 2,
+                        "evicted_by_capacity": 3,
+                        "max_active_pages_limit": 20,
+                        "evaluation_batch_ms": {"p50": 0.5, "p95": 1.2, "p99": 1.8, "max": 2.1},
+                        "latency_waterfall": {
+                            "ingestion_ms": {"p50": 12.0, "p95": 25.0, "p99": 28.0, "max": 30.0},
+                            "compute_ms": {"p50": 0.8, "p95": 1.5, "p99": 2.0, "max": 2.5},
+                            "end_to_end_ms": {"p50": 13.0, "p95": 26.5, "p99": 30.0, "max": 32.5},
+                        },
+                        "sla": {
+                            "throughput_target_eps": 780.0,
+                            "throughput_sla_met": True,
+                            "e2e_latency_p95_target_ms": 1000.0,
+                            "e2e_latency_sla_met": True,
+                            "memory_bounded_sla_met": True,
+                        },
+                        "process_rss_mb_before": 52.0,
+                        "process_rss_mb_after": 53.0,
+                    },
+                    "parquet": {},
+                }
+            },
+            "baseline_comparison": {"comparable": False, "reason": "no earlier run"},
+        }
+        md = report.render_markdown(results)
+        assert "Consumer Scaling (in-memory deque + slide)" in md
+        assert "Waterfall: Ingestion (T_ingest - T_event)" in md
+        assert "Waterfall: Compute (T_proc - T_ingest)" in md
+        assert "Waterfall: End-to-End (T_proc - T_event)" in md
+        assert "Consumer SLA: Throughput >= 780" in md
+        assert "End-to-End Latency p95 <= 1000" in md
+
 
 def test_runner_writes_json_and_markdown_results(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, "argv", [

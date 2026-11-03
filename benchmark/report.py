@@ -22,6 +22,9 @@ COMPARED_METRICS = [
     ("ingestion", "per_event_ms.p95", False),
     ("detection", "windows_per_sec", True),
     ("detection", "evaluation_batch_ms.p95", False),
+    ("consumer_scaling", "events_per_sec", True),
+    ("consumer_scaling", "evaluation_batch_ms.p95", False),
+    ("consumer_scaling", "latency_waterfall.end_to_end_ms.p95", False),
     ("parquet", "raw_events.rows_per_sec", True),
     ("postgres", "edit_events.rows_per_sec", True),
     ("postgres", "edit_events.batch_ms.p95", False),
@@ -147,6 +150,14 @@ def render_markdown(results: dict) -> str:
             f"{_fmt(detection['windows_evaluated'])} windows at {_fmt(detection['slide_seconds'])} s slide, "
             f"{_fmt(detection['micro_batches'])} micro-batches, duplicates {detection['duplicate_windows']} |",
         ]
+        if "consumer_scaling" in stages:
+            cs = stages["consumer_scaling"]
+            lines.append(
+                f"| Consumer Scaling (in-memory deque + slide) | {_fmt(cs['events_per_sec'])} events/s | "
+                f"active pages {_fmt(cs['active_pages'])} (peak {_fmt(cs['peak_active_pages'])}), "
+                f"buffered {_fmt(cs['buffered_events'])}, evicted {_fmt(cs['evicted_pages_total'])} "
+                f"(TTL: {_fmt(cs['evicted_by_ttl'])}, LRU: {_fmt(cs['evicted_by_capacity'])}) |"
+            )
         for dataset, parquet in stages["parquet"].items():
             json_pct = parquet.get("json_reduction_pct")
             json_note = f", JSON reduction {json_pct}% (target >60%)" if json_pct is not None else ""
@@ -171,8 +182,16 @@ def render_markdown(results: dict) -> str:
             "|---|---|---|---|---|",
             _latency_row("Ingestion per event", ingestion["per_event_ms"]),
             _latency_row("Detection per micro-batch", detection["evaluation_batch_ms"]),
-            _latency_row("Parquet raw_events per batch", stages["parquet"]["raw_events"]["batch_ms"]),
         ]
+        if "consumer_scaling" in stages:
+            cs = stages["consumer_scaling"]
+            lines.append(_latency_row("Consumer evaluation per batch", cs.get("evaluation_batch_ms")))
+            lw = cs.get("latency_waterfall", {})
+            lines.append(_latency_row("Waterfall: Ingestion (T_ingest - T_event)", lw.get("ingestion_ms")))
+            lines.append(_latency_row("Waterfall: Compute (T_proc - T_ingest)", lw.get("compute_ms")))
+            lines.append(_latency_row("Waterfall: End-to-End (T_proc - T_event)", lw.get("end_to_end_ms")))
+        parquet_raw_ms = stages.get("parquet", {}).get("raw_events", {}).get("batch_ms") if "parquet" in stages else None
+        lines.append(_latency_row("Parquet raw_events per batch", parquet_raw_ms))
         if "postgres" in stages:
             lines.append(_latency_row("PostgreSQL edit_events per batch", stages["postgres"]["edit_events"]["batch_ms"]))
         if "kafka" in stages:
@@ -188,6 +207,18 @@ def render_markdown(results: dict) -> str:
             f"{_fmt(history['evicted_pages_total'])} evicted, {_fmt(history['final_active_pages'])} at the end. "
             f"Process RSS {detection['process_rss_mb_before']} → {detection['process_rss_mb_after']} MB.",
         ]
+        if "consumer_scaling" in stages:
+            cs = stages["consumer_scaling"]
+            sla = cs.get("sla", {})
+            t_sla = "MET" if sla.get("throughput_sla_met") else "NOT MET"
+            e_sla = "MET" if sla.get("e2e_latency_sla_met") else "NOT MET"
+            m_sla = "BOUNDED" if sla.get("memory_bounded_sla_met") else "UNBOUNDED"
+            lines += [
+                f"Consumer SLA: Throughput >= {sla.get('throughput_target_eps', 780)} ev/s [{t_sla}], "
+                f"End-to-End Latency p95 <= {sla.get('e2e_latency_p95_target_ms', 1000)} ms [{e_sla}], "
+                f"Memory Capacity Limit ({cs.get('max_active_pages_limit', 'n/a')} pages) [{m_sla}].",
+                f"State Store Memory: Process RSS {cs['process_rss_mb_before']} → {cs['process_rss_mb_after']} MB.",
+            ]
         signal = stages.get("expected_signal")
         if signal:
             outcome = "detected" if signal["detected"] else "NOT detected"
