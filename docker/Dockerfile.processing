@@ -19,8 +19,11 @@ RUN pip install --no-cache-dir \
     python-dotenv==1.0.1
 
 COPY common/ ./common/
+COPY ingestion/ ./ingestion/
 COPY processing/ ./processing/
 COPY enrichment/ ./enrichment/
 COPY storage/ ./storage/
+
+ENV PYTHONPATH=/app
 
 CMD ["python", "-m", "processing.streaming_job"]

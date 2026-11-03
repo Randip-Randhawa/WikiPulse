@@ -13,5 +13,7 @@ RUN pip install --no-cache-dir \
 COPY common/ ./common/
 COPY ingestion/ ./ingestion/
 COPY storage/ ./storage/
+COPY scripts/ ./scripts/
+ENV PYTHONPATH=/app
 
 CMD ["python", "-m", "ingestion.sse_consumer"]
