@@ -38,38 +38,49 @@ present them live.
                                  │
                                  ▼
                  ┌───────────────────────────────┐
-                 │   ingestion/sse_consumer.py    │  reconnect + backoff,
-                 │   ingestion/normalizer.py      │  null-safe normalization
-                 └───────────────┬────────────────┘
-                                 │ normalized JSON events
+                 │   ingestion/sse_consumer.py   │  reconnect + backoff,
+                 │   ingestion/normalizer.py     │  null-safe normalization & DLQ routing
+                 └───────────────┬───────────────┘
+                                 │ normalized JSON events (wikipedia.edits.canonical)
                                  ▼
                  ┌───────────────────────────────┐
-                 │      Kafka: wikipedia-edits    │  buffering / decoupling
-                 │   (+ wikipedia-edits-dlq)      │
-                 └───────────────┬────────────────┘
-                                 │
-                                 ▼
-                 ┌───────────────────────────────────────────┐
-                 │   processing/streaming_job.py (PySpark)    │
-                 │   - 5-minute sliding window aggregation    │
-                 │   - anomaly_detector.py (median/MAD +      │
-                 │     count-based fallback)                  │
-                 │   - edit_war_detector.py (mutual reverts)  │
-                 └───────┬─────────────────────────┬──────────┘
-                         │                          │
-                         ▼                          ▼
-        ┌───────────────────────────┐   ┌───────────────────────────┐
-        │  enrichment/liftwing_..   │   │   storage/database.py      │
-        │  (bounded, async-ish,     │   │   storage/parquet_writer   │
-        │   disableable)            │   │   PostgreSQL + Parquet     │
-        └───────────────────────────┘   └───────────┬────────────────┘
-                                                      │
-                                                      ▼
-                                     ┌───────────────────────────────┐
-                                     │   dashboard/app.py (Streamlit) │
-                                     │   health / activity / anomalies│
-                                     │   / edit-wars / trends         │
-                                     └───────────────────────────────┘
+                 │   Kafka: wikipedia-edits      │  partitioned by hash(page_title)
+                 │   (+ wikipedia-edits-dlq)     │  quarantine dead-letter log
+                 └───────┬───────────────┬───────┘
+                         │               │
+      ┌──────────────────┴──┐         ┌──┴──────────────────────────────────────┐
+      │ Primary Spark Path  │         │ Stateful Stream Consumer Worker         │
+      │ processing/streaming│         │ processing/stream_consumer.py           │
+      │ _job.py (PySpark)   │         │ - In-Memory 300s deque, 30s slide       │
+      │ - 5-min sliding win │         │ - Dual-Tier State Eviction (LRU + TTL)  │
+      │ - median/MAD + fall │         │ - Conflict Graph Tracker (mutual revert)│
+      │ - reciprocal revert │         │ - Provenance & Latency Waterfall Audit  │
+      └──────────┬──────────┘         └──────────────────┬──────────────────────┘
+                 │                                       │
+                 └───────────────────┬───────────────────┘
+                                     │ dual-sink persistence
+                                     ▼
+                      ┌─────────────────────────────┐
+                      │    PostgreSQL (Hot Sink)    │
+                      │    - fact_edit_events       │
+                      │    - page_activity_windows  │
+                      │    - fact_anomalies         │
+                      │    - partial & temporal idx │
+                      ├─────────────────────────────┤
+                      │    Parquet Lake (Cold Sink) │
+                      │    - Snappy-compressed      │
+                      │    - date/hour partitioning │
+                      └──────────────┬──────────────┘
+                                     │
+                                     ▼
+                      ┌─────────────────────────────┐
+                      │  dashboard/app.py (Streamlit│
+                      │  - Latency Waterfall Audit  │
+                      │  - Demographics (Bot/Human) │
+                      │  - Conflict Graph Inspector │
+                      │  - Data Lineage & Provenance│
+                      │  - Partition Health Status  │
+                      └─────────────────────────────┘
 ```
 
 `scripts/generate_synthetic_events.py` can publish directly into Kafka so the
@@ -78,26 +89,32 @@ on live Wikimedia traffic.
 
 Alongside the main flow:
 
-- Ingestion and processing each write a row to `pipeline_metrics` (about
-  every 30 seconds while data flows) with counts, latencies and per-stage
-  timings; the dashboard's System Health panel reads them.
+- Ingestion, Spark processing, and the stateful stream consumer write rows to
+  `pipeline_metrics` (about every 30 seconds while data flows) with counts,
+  deterministic waterfall latencies, and per-stage timings; the dashboard's
+  System Health panel reads them.
 - The `maintenance` service (`scripts/maintain_partitions.py`) creates
-  upcoming daily partitions and enforces the 72-hour PostgreSQL retention.
-- `benchmark/` runs seeded synthetic workloads through the pipeline's
-  components and writes JSON and Markdown results.
+  upcoming daily partitions, enforces the 72-hour PostgreSQL retention with a
+  safety **Drain-Before-Drop** gate to Parquet cold storage, and audits partition
+  health for default-partition anomalies.
+- `benchmark/` runs seeded synthetic workloads through all pipeline components,
+  including consumer scaling, LRU/TTL eviction under high cardinality, and
+  deterministic latency waterfall auditing.
 
 ## Technology stack
 
 | Layer            | Technology                                    |
 |-------------------|-----------------------------------------------|
-| Ingestion         | Python, `sseclient-py`, `requests`             |
+| Ingestion         | Python 3.12, `sseclient-py`, `requests`        |
 | Message broker    | Apache Kafka (KRaft mode, via Docker Compose)  |
-| Stream processing | PySpark / Spark Structured Streaming           |
-| Enrichment        | Wikimedia Lift Wing (`httpx`, bounded threads)  |
-| Storage           | PostgreSQL + Parquet (via `pyarrow`/`pandas`)  |
-| Dashboard         | Streamlit + Plotly                              |
+| Stream processing | PySpark / Spark Structured Streaming **and** custom Python stateful stream consumer |
+| Enrichment        | Wikimedia Lift Wing (`httpx`, bounded threads) |
+| Hot Storage       | PostgreSQL 16 (range-partitioned, composite temporal B-Trees, partial indexes) |
+| Cold Storage      | Apache Parquet Lake (Snappy-compressed via `pyarrow`/`duckdb`) |
+| Dashboard         | Streamlit + Plotly                             |
+| Partition Maint.  | Python maintenance daemon with Parquet drain verification |
 | Config            | Environment variables / `.env` (`python-dotenv`)|
-| Tests             | `pytest`                                        |
+| Tests             | `pytest` (220+ unit and integration tests)    |
 
 ## Kafka topic structure
 
@@ -111,27 +128,34 @@ Alongside the main flow:
 ## Event schema
 
 See `common/models.py` (`WikipediaEvent`). Key fields: `event_id`,
-`timestamp`, `wiki`, `event_type`, `page_title`, `page_id`, `namespace`,
-`revision_id`, `previous_revision_id`, `user`, `user_id`, `is_bot`,
-`comment`, `byte_length_new/old/delta`, `is_revert`,
-`revert_target_revision_id`, `ingestion_timestamp`. Every field Wikimedia
-does not guarantee is `Optional` and normalized safely from missing/null
-raw data (`ingestion/normalizer.py`).
+`provenance_id`, `timestamp`, `wiki`, `event_type`, `page_title`, `page_id`, `namespace`,
+`revision_id`, `previous_revision_id`, `user`, `user_id`, `user_type` (`BOT`, `ANONYMOUS`, `REGISTERED`),
+`is_bot`, `is_minor`, `comment`, `comment_length`, `byte_length_new/old/delta`,
+`is_large_jump` (flagged for $|delta| > 100,000$ bytes), `is_revert`,
+`revert_target_revision_id`, `ingestion_timestamp`, `processing_timestamp`.
+Every field Wikimedia does not guarantee is `Optional` and normalized safely
+from missing/null raw data (`ingestion/normalizer.py`).
 
-### Timestamps and lineage
+### Timestamps and Deterministic Latency Waterfall
 
-Three clocks are kept apart:
+Three clocks are rigorously audited across the lifecycle:
 
-| Time | Where it comes from | Stored as |
+| Clock | Origin / Formula | Field |
 |---|---|---|
-| Event time | Wikimedia's `timestamp` (whole seconds, UTC) | `timestamp`; `edit_events.event_time` |
-| Ingestion time | wall clock when the ingestion service normalized the event | `ingestion_timestamp`; `edit_events.ingestion_time` |
-| Processing time | wall clock when the Spark job wrote the event to PostgreSQL | `edit_events.ingested_at` (row insert time) |
+| $T_{\text{event}}$ | MediaWiki server revision creation time (UTC seconds) | `event.timestamp`; `edit_events.event_time` |
+| $T_{\text{ingest}}$ | Wall clock when the Python ingestion service decoded and normalized the event | `event.ingestion_timestamp`; `edit_events.ingestion_time` |
+| $T_{\text{proc}}$ | Clock time when stream sliding window evaluation concludes | `event.processing_timestamp`; `edit_events.processing_time` |
 
-Windows, the watermark and retention all use event time. Every stored
-event keeps its Wikimedia `event_id` and the Kafka `kafka_partition` /
-`kafka_offset` it was read from (in `edit_events` and Parquet `raw_events`),
-so any row can be traced back to its Kafka message.
+From these three anchors, operational latencies are computed deterministically without clock skew:
+- **Ingestion Latency**: $T_{\text{ingest}} - T_{\text{event}}$ (transit over public internet + SSE buffering + JSON decode/normalization)
+- **Compute Latency**: $T_{\text{proc}} - T_{\text{ingest}}$ (Kafka transit + rolling deque maintenance + window evaluation)
+- **End-to-End Latency**: $T_{\text{proc}} - T_{\text{event}}$ (full pipeline latency from Wikipedia user submit to storage)
+
+### Lineage and Provenance Tracking
+
+Every processed event receives a composite provenance identifier:
+$$\text{Provenance ID} = \langle \text{HostNode} \rangle : \langle \text{IngestEpoch} \rangle : \text{part-}\langle \text{KafkaPartition} \rangle : \text{off-}\langle \text{KafkaOffset} \rangle$$
+This enables sub-second root-cause auditing from any alert or aggregate row directly back to the exact worker process and Kafka offset.
 
 ## Spark processing & the five-minute window
 
@@ -252,6 +276,36 @@ distinct concepts, kept in three separate tables/records
 be highly active without being anomalous, anomalous without being an edit
 war, and so on.
 
+## Standalone Stateful Stream Consumer Worker
+
+In addition to the PySpark streaming job, WikiPulse provides a standalone, high-performance
+Python stateful stream consumer worker in `processing/stream_consumer.py`. This worker
+implements a pure-Python sliding-window architecture tailored for microsecond dispatch:
+
+- **In-Memory Sliding Window Engine (`InMemorySlidingWindowEngine`)**:
+  Maintains rolling deques of events across active pages over a 300-second window, evaluated
+  every 30 seconds of event time.
+- **Dual-Tier State Store Memory Eviction**:
+  - *Inactivity TTL Cache Eviction*: Pages with no new edits for `STREAM_PAGE_INACTIVITY_TTL_SECONDS`
+    (default 600 seconds) are automatically evicted from memory.
+  - *LRU Capacity Ceiling*: Active page deques are capped at `STREAM_MAX_ACTIVE_PAGES`
+    (default 50,000 pages) using an `OrderedDict` LRU order, preventing memory exhaustion
+    during extreme multi-page burst traffic.
+- **Conflict Graph Tracker (`ConflictGraphTracker`)**:
+  Constructs directed revert graphs ($Editor_A \rightarrow Editor_B$) over rolling windows,
+  quantifying mutual reverts and flagging genuine editorial disputes while ignoring bot cleanups.
+- **Direct Dual-Sink Persistence**:
+  Flushes aggregated window records and alerts directly to PostgreSQL and Parquet cold storage
+  with zero JVM overhead.
+- **Deterministic Latency Waterfall & Provenance**:
+  Enriches each event with a unique provenance string (`host:epoch:partition:offset`) and audits
+  $T_{\text{event}} \to T_{\text{ingest}} \to T_{\text{proc}}$ latency breakdowns.
+
+Run the standalone consumer:
+```bash
+python -m processing.stream_consumer
+```
+
 ## Lift Wing integration
 
 `enrichment/liftwing_client.py` calls Wikimedia's maintained
@@ -305,20 +359,39 @@ a day already sit in the default partition (for example after maintenance
 was down past the horizon), they are moved into the new daily partition when
 it is created.
 
-### Retention
+### Retention & Safety Drain-Before-Drop Gate
 
 `Database.purge_old_data` (`make purge`, and every
 `POSTGRES_MAINTENANCE_INTERVAL_SECONDS` in the maintenance service) removes
 everything older than `POSTGRES_RETENTION_HOURS` (default 72) from every
 table:
 
-1. Daily partitions that lie entirely before the cutoff are dropped (cheap,
-   no row-by-row delete). The partition containing the cutoff is kept.
-2. Rows older than the cutoff that remain — in the partition holding the
+1. **Drain-Before-Drop Verification**: Before dropping any PostgreSQL partition,
+   the maintenance engine (`is_partition_archived_in_lake()`) queries the Parquet
+   lake to guarantee that corresponding Parquet files exist for all date/hour partitions
+   covered by the table. If archival files are missing, the drop is aborted with a safety
+   warning to prevent data loss.
+2. Daily partitions that lie entirely before the cutoff and are verified as archived
+   are dropped (cheap DDL drop, no row-by-row delete). The partition containing the cutoff is kept.
+3. Rows older than the cutoff that remain — in the partition holding the
    cutoff, the default partitions and the unpartitioned tables
    (`anomaly_events`, `edit_war_signals`, `user_aggregates`,
    `revision_quality_scores`, `pipeline_metrics`) — are deleted, so the
    cutoff is exact to the second.
+
+### Partition Health Auditing
+
+The maintenance daemon provides automated health monitoring for partitioned tables:
+
+```bash
+python -m scripts.maintain_partitions --check-health
+```
+
+- **Default Partition Stray Row Detection**: Rows falling into `edit_events_default` or
+  `page_activity_windows_default` indicate missed partition horizons (e.g. maintenance downtime)
+  or severe clock anomalies. Stray rows trigger automated log alerts and telemetry warnings.
+- **Health Telemetry**: Partition health summaries (total partitions, default partition rows,
+  oldest partition) are emitted to `pipeline_metrics` and rendered on the Streamlit dashboard.
 
 Every dropped partition and the deleted row counts are logged. All tables use
 the same cutoff on their own time column, so an anomaly is never kept after
@@ -425,15 +498,25 @@ panels apply them together. Queries are cached for
   rate, latencies, Kafka offsets behind, PostgreSQL / Parquet write times
   and errors, page-history size and evictions — plus throughput and latency
   over time.
+- Latency Waterfall: end-to-end latency profiling decomposing delay into
+  $T_{\text{event}} \to T_{\text{ingest}}$ (network/SSE decode) and
+  $T_{\text{ingest}} \to T_{\text{proc}}$ (stream evaluation/storage), complete
+  with percentile distributions and latency SLA tracking.
 - Live Activity: edits per minute (human vs. bot), most active pages, and
   each page's edit velocity in its latest finalized window.
+- User Demographics: categorical breakdown of editors into Registered Humans,
+  Automated Bots, and Anonymous IP editors, displaying relative velocity shares.
 - Activity Anomalies: anomalous windows with their baseline median, MAD,
   score and detection type, anomalies per hour, and the highest median/MAD
-  scores. Count-fallback scores are raw counts and are not ranked against
-  median/MAD scores.
-- Edit-War Signals: signals with both editors, mutual and total reverts and
-  conflict score, signals per hour, and the revert events behind a chosen
-  page.
+  scores from `fact_anomalies`.
+- Conflict Graph Inspector: directed reciprocal revert relationships
+  ($Editor_A \leftrightarrow Editor_B$) identifying genuine editorial wars,
+  with mutual revert counts, conflict scores, and dispute duration.
+- Data Lineage & Provenance: forensic inspector allowing operators to input any
+  `provenance_id` to instantly retrieve worker node, Kafka partition, offset,
+  and ingestion epoch.
+- Partition Maintenance Health: live audit of active daily PostgreSQL partitions,
+  safety drain status, and default partition stray row counts.
 - Historical Trends: edits per hour, a comparison of selected pages, and
   events per day from the Parquet history (counted from file footers, so no
   row data is loaded).
@@ -570,6 +653,7 @@ the project's own code, stage by stage:
 |---|---|
 | ingestion | JSON decode, wiki/type filter, normalization, dead-letter routing, JSON serialization (`WikimediaSSEConsumer.process_sse_data`, in-memory publisher) |
 | detection | `evaluate_windows`: aggregation, median/MAD, reciprocal reverts, page-history store with TTL |
+| consumer_scaling | `InMemorySlidingWindowEngine`: high-cardinality state store scaling, LRU capacity limit + inactivity TTL eviction, deterministic latency waterfall ($T_{event} \to T_{ingest} \to T_{proc}$) |
 | parquet | `ParquetWriter.write_records` in micro-batch-sized batches |
 | postgres (opt-in) | `Database.upsert_edit_events` / `upsert_activity_windows` against the configured database; rows use `wiki = benchmarkwiki` and are deleted afterwards |
 | kafka (opt-in) | `EventPublisher` to `<KAFKA_TOPIC_EDITS>-benchmark` and back through a consumer |
